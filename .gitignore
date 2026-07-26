@@ -1,0 +1,61 @@
+# Rust and generated packages
+/target/
+/dist/
+
+# Local note-tool state and write logs
+/.siyuan-mcp/
+
+# Private deployment research and server operations
+/deploy/
+
+# Local private infrastructure configuration
+/private-pki/
+private-infra.json
+relay-token.txt
+*-token.txt
+*.local.json
+*.local.toml
+*.local.yaml
+*.local.yml
+
+# Environment files may contain hosts, tokens or credentials
+.env
+.env.*
+*.env
+!.env.example
+!*.env.example
+
+# Private keys, certificates and signing material
+*.key
+*.pem
+*.p12
+*.pfx
+*.ppk
+*.jks
+*.keystore
+*.csr
+*.srl
+*.crt
+*.cer
+*.der
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+
+# Keep secret directories empty in Git except for their ignore rule
+**/secrets/*
+!**/secrets/.gitignore
+
+# Runtime data
+*.log
+log/
+*.part
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

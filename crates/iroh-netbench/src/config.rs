@@ -1,0 +1,76 @@
+//! Client benchmark configuration and presets.
+
+use std::time::Duration;
+
+/// Parameters for one complete benchmark run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetBenchConfig {
+    /// Maximum time to wait for a direct path before measurements begin.
+    pub path_stabilization_timeout: Duration,
+    /// Idle RTT measurement duration.
+    pub latency_duration: Duration,
+    /// Delay between idle RTT probes.
+    pub latency_interval: Duration,
+    /// Datagram timeout measurement duration.
+    pub loss_duration: Duration,
+    /// Number of datagram probes sent per second.
+    pub loss_rate_per_second: u32,
+    /// Time after the last probe before outstanding probes time out.
+    pub probe_timeout: Duration,
+    /// Warm-up before download accounting starts.
+    pub download_warmup: Duration,
+    /// Accounted download duration.
+    pub download_duration: Duration,
+    /// Warm-up before upload accounting starts.
+    pub upload_warmup: Duration,
+    /// Accounted upload duration.
+    pub upload_duration: Duration,
+    /// Number of parallel unidirectional streams per throughput direction.
+    pub parallel_streams: u16,
+    /// Payload size written at a time.
+    pub chunk_size: u32,
+    /// Interval between progress samples.
+    pub sample_interval: Duration,
+}
+
+impl NetBenchConfig {
+    /// A roughly 15-second interactive preset.
+    #[must_use]
+    pub fn quick() -> Self {
+        Self {
+            path_stabilization_timeout: Duration::from_secs(3),
+            latency_duration: Duration::from_secs(2),
+            latency_interval: Duration::from_millis(100),
+            loss_duration: Duration::from_secs(2),
+            loss_rate_per_second: 100,
+            probe_timeout: Duration::from_secs(2),
+            download_warmup: Duration::from_secs(1),
+            download_duration: Duration::from_secs(5),
+            upload_warmup: Duration::from_secs(2),
+            upload_duration: Duration::from_secs(5),
+            parallel_streams: 4,
+            chunk_size: 64 * 1024,
+            sample_interval: Duration::from_millis(250),
+        }
+    }
+
+    /// A roughly 32-second default preset.
+    #[must_use]
+    pub fn standard() -> Self {
+        Self {
+            latency_duration: Duration::from_secs(3),
+            loss_duration: Duration::from_secs(5),
+            download_warmup: Duration::from_secs(2),
+            download_duration: Duration::from_secs(10),
+            upload_warmup: Duration::from_secs(2),
+            upload_duration: Duration::from_secs(10),
+            ..Self::quick()
+        }
+    }
+}
+
+impl Default for NetBenchConfig {
+    fn default() -> Self {
+        Self::standard()
+    }
+}
