@@ -3,7 +3,7 @@
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -33,6 +33,18 @@ const UPLOAD_STREAM_MAGIC: u8 = 0x55;
 
 type ConnectionObserver = Arc<dyn Fn(Connection) + Send + Sync>;
 
+/// Receiver-side policy for bandwidth-saturating upload and download measurements.
+///
+/// This policy does not affect connectivity checks or low-bandwidth latency and loss probes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ThroughputPolicy {
+    /// Accept throughput measurements, subject to the configured server limits.
+    #[default]
+    Allow,
+    /// Reject throughput measurements while continuing to serve low-bandwidth probes.
+    Deny,
+}
+
 /// Server-side benchmark protocol configuration.
 #[allow(
     clippy::struct_field_names,
@@ -44,6 +56,7 @@ pub struct NetBenchProtocol {
     max_test_duration: Duration,
     max_parallel_streams: u16,
     max_chunk_size: u32,
+    throughput_allowed: Arc<AtomicBool>,
     permits: Arc<Semaphore>,
     connection_observer: Option<ConnectionObserver>,
 }
@@ -55,6 +68,7 @@ impl std::fmt::Debug for NetBenchProtocol {
             .field("max_concurrent_tests", &self.max_concurrent_tests)
             .field("max_test_duration", &self.max_test_duration)
             .field("max_parallel_streams", &self.max_parallel_streams)
+            .field("throughput_policy", &self.throughput_policy())
             .field("max_chunk_size", &self.max_chunk_size)
             .field(
                 "has_connection_observer",
@@ -89,10 +103,34 @@ impl NetBenchProtocol {
         self.max_parallel_streams
     }
 
+    /// Current receiver-side policy for upload and download throughput measurements.
+    #[must_use]
+    pub fn throughput_policy(&self) -> ThroughputPolicy {
+        if self.throughput_allowed.load(Ordering::Relaxed) {
+            ThroughputPolicy::Allow
+        } else {
+            ThroughputPolicy::Deny
+        }
+    }
+
+    /// Changes the receiver-side throughput policy for future measurement phases.
+    ///
+    /// Existing low-bandwidth latency and loss probes remain available under either policy.
+    pub fn set_throughput_policy(&self, policy: ThroughputPolicy) {
+        self.throughput_allowed
+            .store(policy == ThroughputPolicy::Allow, Ordering::Relaxed);
+    }
+
     fn limits(&self) -> ServerLimits {
         ServerLimits {
             max_test_duration_ms: duration_ms(self.max_test_duration),
-            max_parallel_streams: self.max_parallel_streams,
+            // Version 1 clients already understand this field. Zero is used as the
+            // backwards-compatible signal that no throughput streams are accepted.
+            max_parallel_streams: if self.throughput_policy() == ThroughputPolicy::Allow {
+                self.max_parallel_streams
+            } else {
+                0
+            },
             max_chunk_size: self.max_chunk_size,
         }
     }
@@ -114,6 +152,9 @@ impl NetBenchProtocol {
         streams: u16,
         chunk_size: u32,
     ) -> Result<Duration> {
+        if self.throughput_policy() == ThroughputPolicy::Deny || self.max_parallel_streams == 0 {
+            return Err(Error::ThroughputDeniedByPeer);
+        }
         let duration = self.validate_phase(duration_ms)?;
         if streams == 0 || streams > self.max_parallel_streams {
             return Err(Error::Protocol(format!(
@@ -214,7 +255,22 @@ impl NetBenchProtocol {
                     streams,
                     chunk_size,
                 } => {
-                    let duration = self.validate_throughput(duration_ms, streams, chunk_size)?;
+                    let duration = match self.validate_throughput(duration_ms, streams, chunk_size)
+                    {
+                        Ok(duration) => duration,
+                        Err(error) => {
+                            let _ = write_control(
+                                &mut control_send,
+                                &ControlMessage::Error {
+                                    code: ErrorCode::InvalidRequest,
+                                    message: error.to_string(),
+                                },
+                            )
+                            .await;
+                            echo_task.abort();
+                            return Err(error);
+                        }
+                    };
                     let download_streams =
                         open_download_streams(connection.clone(), streams).await?;
                     write_control(&mut control_send, &ControlMessage::TestReady { test_id })
@@ -242,7 +298,18 @@ impl NetBenchProtocol {
                     streams,
                     chunk_size,
                 } => {
-                    let _duration = self.validate_throughput(duration_ms, streams, chunk_size)?;
+                    if let Err(error) = self.validate_throughput(duration_ms, streams, chunk_size) {
+                        let _ = write_control(
+                            &mut control_send,
+                            &ControlMessage::Error {
+                                code: ErrorCode::InvalidRequest,
+                                message: error.to_string(),
+                            },
+                        )
+                        .await;
+                        echo_task.abort();
+                        return Err(error);
+                    }
                     let upload_streams = accept_upload_streams(connection.clone(), streams).await?;
                     write_control(&mut control_send, &ControlMessage::TestReady { test_id })
                         .await?;
@@ -315,6 +382,7 @@ pub struct NetBenchProtocolBuilder {
     max_test_duration: Duration,
     max_parallel_streams: u16,
     max_chunk_size: u32,
+    throughput_policy: ThroughputPolicy,
     connection_observer: Option<ConnectionObserver>,
 }
 
@@ -325,6 +393,7 @@ impl std::fmt::Debug for NetBenchProtocolBuilder {
             .field("max_concurrent_tests", &self.max_concurrent_tests)
             .field("max_test_duration", &self.max_test_duration)
             .field("max_parallel_streams", &self.max_parallel_streams)
+            .field("throughput_policy", &self.throughput_policy)
             .field("max_chunk_size", &self.max_chunk_size)
             .field(
                 "has_connection_observer",
@@ -356,6 +425,13 @@ impl NetBenchProtocolBuilder {
         self
     }
 
+    /// Sets whether peers may run bandwidth-saturating upload and download measurements.
+    #[must_use]
+    pub const fn throughput_policy(mut self, value: ThroughputPolicy) -> Self {
+        self.throughput_policy = value;
+        self
+    }
+
     /// Observes each accepted benchmark connection.
     #[must_use]
     pub fn on_connection(mut self, observer: impl Fn(Connection) + Send + Sync + 'static) -> Self {
@@ -379,6 +455,10 @@ impl NetBenchProtocolBuilder {
             max_test_duration: self.max_test_duration,
             max_parallel_streams: self.max_parallel_streams,
             max_chunk_size: self.max_chunk_size,
+            throughput_allowed: Arc::new(AtomicBool::new(matches!(
+                self.throughput_policy,
+                ThroughputPolicy::Allow
+            ))),
             permits: Arc::new(Semaphore::new(self.max_concurrent_tests)),
             connection_observer: self.connection_observer,
         }
@@ -392,6 +472,7 @@ impl Default for NetBenchProtocolBuilder {
             max_test_duration: Duration::from_secs(30),
             max_parallel_streams: 8,
             max_chunk_size: DEFAULT_MAX_CHUNK_SIZE,
+            throughput_policy: ThroughputPolicy::Allow,
             connection_observer: None,
         }
     }
@@ -549,4 +630,23 @@ fn duration_ms(duration: Duration) -> u32 {
 
 fn duration_ns(duration: Duration) -> u64 {
     u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn denied_throughput_is_advertised_and_enforced_without_blocking_probes() {
+        let protocol = NetBenchProtocol::builder()
+            .throughput_policy(ThroughputPolicy::Deny)
+            .build();
+
+        assert_eq!(protocol.limits().max_parallel_streams, 0);
+        assert!(protocol.validate_phase(1_000).is_ok());
+        assert!(matches!(
+            protocol.validate_throughput(1_000, 1, 1_024),
+            Err(Error::ThroughputDeniedByPeer)
+        ));
+    }
 }

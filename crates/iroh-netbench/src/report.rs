@@ -152,3 +152,24 @@ pub struct NetBenchReport {
     /// QUIC path-statistics delta.
     pub transport: TransportReport,
 }
+
+/// Complete result of a low-bandwidth latency and loss probe run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NetBenchProbeReport {
+    /// JSON schema version.
+    pub schema_version: u16,
+    /// Negotiated wire protocol version.
+    pub protocol_version: u16,
+    /// Remote endpoint identity.
+    pub peer_id: EndpointId,
+    /// Wall-clock duration of the run.
+    pub total_duration: Duration,
+    /// Connection establishment and selected path details.
+    pub connection: ConnectionReport,
+    /// Idle latency and jitter.
+    pub idle_latency: LatencyReport,
+    /// Application Datagram timeout results.
+    pub loss: LossReport,
+    /// QUIC path-statistics delta during the probe run.
+    pub transport: TransportReport,
+}

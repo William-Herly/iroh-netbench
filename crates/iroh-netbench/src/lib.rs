@@ -13,7 +13,7 @@ mod statistics;
 pub mod wire;
 
 pub use client::{NetBenchClient, NetBenchTest};
-pub use config::NetBenchConfig;
+pub use config::{NetBenchConfig, NetBenchProbeConfig};
 pub use error::{Error, Result};
 pub use event::{
     ConnectionInfo, ConnectionStage, LatencySample, LossSample, NetBenchEvent, ThroughputDirection,
@@ -23,10 +23,10 @@ pub use monitor::{
     ConnectionMetrics, MonitoredConnectionId, MonitoredConnectionState, SessionMetrics,
     SessionMonitor, SessionMonitorConfig,
 };
-pub use protocol::{NetBenchProtocol, NetBenchProtocolBuilder};
+pub use protocol::{NetBenchProtocol, NetBenchProtocolBuilder, ThroughputPolicy};
 pub use report::{
-    ConnectionReport, LatencyReport, LoadedLatencyReport, LossReport, NetBenchReport, PathKind,
-    ThroughputReport, TransportReport,
+    ConnectionReport, LatencyReport, LoadedLatencyReport, LossReport, NetBenchProbeReport,
+    NetBenchReport, PathKind, ThroughputReport, TransportReport,
 };
 
 /// ALPN used by the benchmark protocol.

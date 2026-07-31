@@ -95,6 +95,42 @@ let report = test.result().await?;
 `NetBenchClient` 复用宿主 Endpoint，但会创建一条独立的 `/iroh/netbench/1`
 Connection。该连接包含控制 Stream、并行上传/下载 Stream 和 Datagram Probe。
 
+### 低带宽探测
+
+延迟、抖动和 Datagram 超时测量可以独立运行，不会打开吞吐 Stream：
+
+```rust,ignore
+use iroh_netbench::NetBenchProbeConfig;
+
+let report = NetBenchClient::new(endpoint.clone())
+    .run_probes(peer_addr, NetBenchProbeConfig::quick())
+    .await?;
+```
+
+结果类型为 `NetBenchProbeReport`，包含连接、延迟、丢包和传输统计，不包含上传或下载结果。
+
+### 接收端吞吐策略
+
+接收端可以允许或拒绝占用大量带宽的上传和下载测量：
+
+```rust,ignore
+use iroh_netbench::{NetBenchProtocol, ThroughputPolicy};
+
+let protocol = NetBenchProtocol::builder()
+    .throughput_policy(ThroughputPolicy::Deny)
+    .build();
+
+// 保留一个 clone 后，可以在不重启 Endpoint 的情况下更新策略。
+protocol.set_throughput_policy(ThroughputPolicy::Allow);
+```
+
+为保持兼容，默认值是 `Allow`。设置为 `Deny` 后，连通性检查和 `run_probes` 仍可运行；Quick、
+Standard 以及其他完整吞吐测试会在任何测量开始前返回
+`Error::ThroughputDeniedByPeer`，客户端不会静默降级测试内容。
+
+该能力复用协议 v1 现有的 `ServerLimits` 字段，不更新线协议版本。服务端在收到吞吐阶段请求时
+也会再次强制检查策略。
+
 以 A 发起测速 B 为例，控制角色在整轮测试中保持不变：
 
 | 项目 | 数据方向 | 结果统计 |
@@ -161,6 +197,7 @@ monitor 不持有连接生命周期，不发送心跳，也不会主动产生测
 | `ConnectionMetrics.recent_loss_ratio` | QUIC 近期判定的丢包 |
 | `NetBenchReport.download` | 客户端收到的应用 payload |
 | `NetBenchReport.upload` | 服务端收到的应用 payload |
+| `NetBenchProbeReport` | 低带宽连接、延迟、丢包和传输结果 |
 | `LatencyReport` | 应用层 Datagram 往返样本 |
 | `LossReport.timeout_ratio` | 探测包超时率，不代表绝对物理丢包率 |
 
@@ -178,6 +215,9 @@ monitor 不持有连接生命周期，不发送心跳，也不会主动产生测
 
 交互式检查使用 `NetBenchConfig::quick()`；需要更稳定的结果时使用
 `NetBenchConfig::standard()`。
+
+`NetBenchProbeConfig::quick()` 和 `NetBenchProbeConfig::standard()` 使用对应的延迟、丢包
+参数，但不会运行预热、上传、下载或负载延迟阶段。
 
 ## 示例
 

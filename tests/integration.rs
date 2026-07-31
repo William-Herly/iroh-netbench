@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use iroh::{Endpoint, RelayMode, endpoint::presets, protocol::Router};
 use iroh_netbench::{
-    NETBENCH_ALPN, NetBenchClient, NetBenchConfig, NetBenchProtocol, PROTOCOL_VERSION,
-    SessionMonitor, SessionMonitorConfig,
+    Error, NETBENCH_ALPN, NetBenchClient, NetBenchConfig, NetBenchEvent, NetBenchProbeConfig,
+    NetBenchProtocol, PROTOCOL_VERSION, SessionMonitor, SessionMonitorConfig, ThroughputPolicy,
 };
 
 #[test]
@@ -13,6 +13,21 @@ fn public_protocol_identity_is_stable() {
     assert_eq!(NETBENCH_ALPN, b"/iroh/netbench/1");
     assert_eq!(PROTOCOL_VERSION, 1);
     assert_eq!(NetBenchProtocol::default().max_parallel_streams(), 8);
+    assert_eq!(
+        NetBenchProtocol::default().throughput_policy(),
+        ThroughputPolicy::Allow
+    );
+}
+
+#[test]
+fn throughput_policy_is_shared_by_protocol_clones() {
+    let protocol = NetBenchProtocol::builder()
+        .throughput_policy(ThroughputPolicy::Deny)
+        .build();
+    let control = protocol.clone();
+    assert_eq!(protocol.throughput_policy(), ThroughputPolicy::Deny);
+    control.set_throughput_policy(ThroughputPolicy::Allow);
+    assert_eq!(protocol.throughput_policy(), ThroughputPolicy::Allow);
 }
 
 #[tokio::test]
@@ -73,6 +88,67 @@ async fn local_endpoints_complete_a_real_benchmark() {
     assert_eq!(server_metrics.connections[0].label, "netbench-server");
     assert!(client_metrics.total_rx_bytes > 0);
     assert!(client_metrics.total_tx_bytes > 0);
+
+    router.shutdown().await.unwrap();
+    client_endpoint.close().await;
+}
+
+#[tokio::test]
+async fn denied_throughput_fails_early_but_probe_only_still_completes() {
+    let server = Endpoint::builder(presets::Minimal)
+        .relay_mode(RelayMode::Disabled)
+        .bind()
+        .await
+        .unwrap();
+    let protocol = NetBenchProtocol::builder()
+        .throughput_policy(ThroughputPolicy::Deny)
+        .build();
+    let router = Router::builder(server.clone())
+        .accept(NETBENCH_ALPN, protocol)
+        .spawn();
+    let client_endpoint = Endpoint::builder(presets::Minimal)
+        .relay_mode(RelayMode::Disabled)
+        .bind()
+        .await
+        .unwrap();
+    let client = NetBenchClient::new(client_endpoint.clone());
+
+    let mut full_test = client
+        .start(server.addr(), NetBenchConfig::quick())
+        .await
+        .unwrap();
+    let mut measurement_started = false;
+    while let Some(event) = full_test.next().await {
+        measurement_started |= matches!(
+            event,
+            NetBenchEvent::LatencyStarted
+                | NetBenchEvent::LossStarted
+                | NetBenchEvent::DownloadWarmupStarted
+                | NetBenchEvent::DownloadStarted
+                | NetBenchEvent::UploadWarmupStarted
+                | NetBenchEvent::UploadStarted
+        );
+    }
+    assert!(!measurement_started);
+    assert!(matches!(
+        full_test.result().await,
+        Err(Error::ThroughputDeniedByPeer)
+    ));
+
+    let mut probe_config = NetBenchProbeConfig::quick();
+    probe_config.path_stabilization_timeout = Duration::from_millis(200);
+    probe_config.latency_duration = Duration::from_millis(200);
+    probe_config.latency_interval = Duration::from_millis(25);
+    probe_config.loss_duration = Duration::from_millis(200);
+    probe_config.loss_rate_per_second = 20;
+    probe_config.probe_timeout = Duration::from_millis(300);
+    let report = client
+        .run_probes(server.addr(), probe_config)
+        .await
+        .unwrap();
+    assert_eq!(report.protocol_version, PROTOCOL_VERSION);
+    assert!(report.idle_latency.samples > 0);
+    assert!(report.loss.sent > 0);
 
     router.shutdown().await.unwrap();
     client_endpoint.close().await;

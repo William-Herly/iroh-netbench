@@ -99,6 +99,44 @@ let report = test.result().await?;
 connection. One benchmark connection contains a control stream, parallel upload/download streams
 and Datagram probes.
 
+### Low-bandwidth probes
+
+Latency, jitter and Datagram timeout measurements can run without opening throughput streams:
+
+```rust,ignore
+use iroh_netbench::NetBenchProbeConfig;
+
+let report = NetBenchClient::new(endpoint.clone())
+    .run_probes(peer_addr, NetBenchProbeConfig::quick())
+    .await?;
+```
+
+The result is a `NetBenchProbeReport` with connection, latency, loss and transport data, but no
+upload or download result.
+
+### Receiver throughput policy
+
+The receiving endpoint can allow or deny bandwidth-saturating upload and download measurements:
+
+```rust,ignore
+use iroh_netbench::{NetBenchProtocol, ThroughputPolicy};
+
+let protocol = NetBenchProtocol::builder()
+    .throughput_policy(ThroughputPolicy::Deny)
+    .build();
+
+// A retained clone can update the policy without restarting the endpoint.
+protocol.set_throughput_policy(ThroughputPolicy::Allow);
+```
+
+`Allow` is the default for backwards compatibility. Under `Deny`, connectivity checks and
+`run_probes` remain available, while Quick, Standard and other full throughput runs return
+`Error::ThroughputDeniedByPeer` before measurements begin. The client does not silently downgrade
+the requested test.
+
+This reuses the existing protocol-v1 `ServerLimits` fields and does not change the wire protocol
+version. The server also enforces the policy when a throughput phase is requested.
+
 For a run initiated by A against B, the control roles remain fixed:
 
 | Measurement | Data direction | Result accounting |
@@ -166,6 +204,7 @@ Passive monitoring and active benchmarking use different counters:
 | `ConnectionMetrics.recent_loss_ratio` | Recent QUIC-declared loss |
 | `NetBenchReport.download` | Client-received application payload |
 | `NetBenchReport.upload` | Server-received application payload |
+| `NetBenchProbeReport` | Low-bandwidth connection, latency, loss and transport results |
 | `LatencyReport` | Application Datagram round-trip samples |
 | `LossReport.timeout_ratio` | Probe timeout rate, not absolute physical packet loss |
 
@@ -183,6 +222,9 @@ Session throughput is the sum of all connections explicitly registered with the 
 
 Use `NetBenchConfig::quick()` for interactive checks and `NetBenchConfig::standard()` for a more
 stable result.
+
+`NetBenchProbeConfig::quick()` and `NetBenchProbeConfig::standard()` use the corresponding latency
+and loss settings without running warm-up, upload, download or loaded-latency stages.
 
 ## Examples
 

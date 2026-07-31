@@ -37,6 +37,10 @@ pub enum Error {
         stage: &'static str,
     },
 
+    /// The peer allows low-bandwidth probes but denies throughput measurements.
+    #[error("peer policy denies throughput measurements")]
+    ThroughputDeniedByPeer,
+
     /// The peer rejected or failed a protocol operation.
     #[error("peer error {code}: {message}")]
     Peer {

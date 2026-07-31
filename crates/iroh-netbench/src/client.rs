@@ -22,9 +22,9 @@ use tokio::{
 
 use crate::{
     ConnectionInfo, ConnectionReport, ConnectionStage, Error, LatencySample, LoadedLatencyReport,
-    LossReport, LossSample, NETBENCH_ALPN, NetBenchConfig, NetBenchEvent, NetBenchReport,
-    PROTOCOL_VERSION, PathKind, Result, SCHEMA_VERSION, SessionMonitor, ThroughputDirection,
-    ThroughputReport, ThroughputSample, TransportReport,
+    LossReport, LossSample, NETBENCH_ALPN, NetBenchConfig, NetBenchEvent, NetBenchProbeConfig,
+    NetBenchProbeReport, NetBenchReport, PROTOCOL_VERSION, PathKind, Result, SCHEMA_VERSION,
+    SessionMonitor, ThroughputDirection, ThroughputReport, ThroughputSample, TransportReport,
     statistics::latency_report,
     wire::{
         Capabilities, ControlMessage, PROBE_MAGIC, Probe, ProbeKind, read_control, write_control,
@@ -175,6 +175,30 @@ impl NetBenchClient {
     /// Returns a connection, negotiation, measurement, timeout, cancellation, or peer error.
     pub async fn run(&self, peer: EndpointAddr, config: NetBenchConfig) -> Result<NetBenchReport> {
         self.start(peer, config).await?.result().await
+    }
+
+    /// Runs only the low-bandwidth latency and loss probes.
+    ///
+    /// This does not open upload or download throughput streams and remains available when the
+    /// peer denies bandwidth-saturating measurements.
+    ///
+    /// # Errors
+    ///
+    /// Returns a connection, negotiation, measurement, or peer error.
+    pub async fn run_probes(
+        &self,
+        peer: EndpointAddr,
+        config: NetBenchProbeConfig,
+    ) -> Result<NetBenchProbeReport> {
+        let (event_tx, _event_rx) = mpsc::channel(128);
+        run_probe_benchmark(
+            self.endpoint.clone(),
+            peer,
+            config,
+            &EventSink(event_tx),
+            self.connection_observer.as_ref(),
+        )
+        .await
     }
 
     /// Starts a benchmark and returns an event stream plus final result handle.
@@ -523,10 +547,186 @@ async fn run_benchmark(
     })
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "mirrors the full benchmark negotiation while omitting all throughput phases"
+)]
+async fn run_probe_benchmark(
+    endpoint: Endpoint,
+    peer: EndpointAddr,
+    config: NetBenchProbeConfig,
+    events: &EventSink,
+    connection_observer: Option<&ConnectionObserver>,
+) -> Result<NetBenchProbeReport> {
+    let total_started = Instant::now();
+    events.send(NetBenchEvent::Connecting);
+    events.send(NetBenchEvent::ConnectionStage(
+        ConnectionStage::PreparingAddress,
+    ));
+    let connect_started = Instant::now();
+    events.send(NetBenchEvent::ConnectionStage(
+        ConnectionStage::QuicHandshakeStarted,
+    ));
+    let connection = endpoint
+        .connect(peer, NETBENCH_ALPN)
+        .await
+        .map_err(Error::network)?;
+    if let Some(observer) = connection_observer {
+        observer(connection.clone());
+    }
+    let connect_time = connect_started.elapsed();
+    events.send(NetBenchEvent::ConnectionStage(
+        ConnectionStage::QuicHandshakeCompleted {
+            elapsed: connect_time,
+        },
+    ));
+    let peer_id = connection.remote_id();
+
+    let (mut control_send, mut control_recv) =
+        connection.open_bi().await.map_err(Error::network)?;
+    events.send(NetBenchEvent::ConnectionStage(
+        ConnectionStage::ControlStreamOpened,
+    ));
+    write_control(
+        &mut control_send,
+        &ControlMessage::ClientHello {
+            protocol_versions: vec![PROTOCOL_VERSION],
+            capabilities: Capabilities {
+                datagram_probes: true,
+                loaded_latency: false,
+                path_stats: true,
+            },
+        },
+    )
+    .await?;
+    events.send(NetBenchEvent::ConnectionStage(
+        ConnectionStage::ClientHelloSent,
+    ));
+
+    let hello = read_control(&mut control_recv).await?;
+    let first_control_message_time = connect_started.elapsed();
+    let ControlMessage::ServerHello {
+        selected_version,
+        limits,
+        capabilities,
+    } = hello
+    else {
+        return Err(peer_or_protocol_error(hello));
+    };
+    if selected_version != PROTOCOL_VERSION {
+        return Err(Error::UnsupportedProtocolVersion);
+    }
+    events.send(NetBenchEvent::ConnectionStage(
+        ConnectionStage::ServerHelloReceived {
+            version: selected_version,
+        },
+    ));
+    if !capabilities.datagram_probes {
+        return Err(Error::Protocol(
+            "peer does not support QUIC Datagram probes".to_owned(),
+        ));
+    }
+    validate_probes_against_server_limits(&config, limits)?;
+
+    let (initial_path, time_to_direct) = stabilize_path(
+        &connection,
+        config.path_stabilization_timeout,
+        connect_started,
+        events,
+    )
+    .await;
+    events.send(NetBenchEvent::Connected(ConnectionInfo {
+        connect_time,
+        path: initial_path,
+    }));
+    let path_monitor = spawn_path_monitor(connection.clone(), events.clone());
+    let before = TransportSnapshot::capture(&connection);
+
+    let mut test_id = 1_u64;
+    events.send(NetBenchEvent::LatencyStarted);
+    write_control(
+        &mut control_send,
+        &ControlMessage::StartLatency {
+            test_id,
+            duration_ms: duration_ms(config.latency_duration),
+            interval_ms: duration_ms(config.latency_interval),
+        },
+    )
+    .await?;
+    let idle = measure_probes(
+        connection.clone(),
+        test_id,
+        config.latency_duration,
+        config.latency_interval,
+        config.probe_timeout,
+        ProbeEventMode::Latency(events.clone()),
+    )
+    .await?;
+    write_control(&mut control_send, &ControlMessage::StopTest { test_id }).await?;
+    let idle_latency = latency_report(&idle.rtts);
+    test_id += 1;
+
+    events.send(NetBenchEvent::LossStarted);
+    write_control(
+        &mut control_send,
+        &ControlMessage::StartLoss {
+            test_id,
+            duration_ms: duration_ms(config.loss_duration),
+            rate_per_second: config.loss_rate_per_second,
+            timeout_ms: duration_ms(config.probe_timeout),
+        },
+    )
+    .await?;
+    let loss_interval =
+        Duration::from_secs_f64(1.0 / f64::from(config.loss_rate_per_second.max(1)));
+    let loss_samples = measure_probes(
+        connection.clone(),
+        test_id,
+        config.loss_duration,
+        loss_interval,
+        config.probe_timeout,
+        ProbeEventMode::Loss(events.clone()),
+    )
+    .await?;
+    write_control(&mut control_send, &ControlMessage::StopTest { test_id }).await?;
+    let loss = loss_samples.loss_report();
+
+    let after = TransportSnapshot::capture(&connection);
+    path_monitor.abort();
+    let final_path = selected_path_kind(&connection);
+    let path = if initial_path == final_path {
+        final_path
+    } else {
+        PathKind::Mixed
+    };
+    control_send.finish().map_err(Error::network)?;
+    connection.close(0_u8.into(), b"netbench probes complete");
+
+    Ok(NetBenchProbeReport {
+        schema_version: SCHEMA_VERSION,
+        protocol_version: selected_version,
+        peer_id,
+        total_duration: total_started.elapsed(),
+        connection: ConnectionReport {
+            connect_time,
+            first_control_message_time,
+            path,
+            became_direct: time_to_direct.is_some(),
+            time_to_direct,
+        },
+        idle_latency,
+        loss,
+        transport: after.delta(before),
+    })
+}
+
 fn validate_against_server_limits(
     config: &NetBenchConfig,
     limits: crate::wire::ServerLimits,
 ) -> Result<()> {
+    if limits.max_parallel_streams == 0 {
+        return Err(Error::ThroughputDeniedByPeer);
+    }
     let maximum = Duration::from_millis(u64::from(limits.max_test_duration_ms));
     for duration in [
         config.latency_duration,
@@ -554,6 +754,22 @@ fn validate_against_server_limits(
             "requested {} byte chunks but server allows {}",
             config.chunk_size, limits.max_chunk_size
         )));
+    }
+    Ok(())
+}
+
+fn validate_probes_against_server_limits(
+    config: &NetBenchProbeConfig,
+    limits: crate::wire::ServerLimits,
+) -> Result<()> {
+    let maximum = Duration::from_millis(u64::from(limits.max_test_duration_ms));
+    for duration in [config.latency_duration, config.loss_duration] {
+        if duration > maximum {
+            return Err(Error::DurationLimitExceeded {
+                requested: duration,
+                maximum,
+            });
+        }
     }
     Ok(())
 }
