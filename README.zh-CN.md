@@ -95,6 +95,31 @@ let report = test.result().await?;
 `NetBenchClient` 复用宿主 Endpoint，但会创建一条独立的 `/iroh/netbench/1`
 Connection。该连接包含控制 Stream、并行上传/下载 Stream 和 Datagram Probe。
 
+### 有界时长与取消
+
+吞吐配置时长是固定的计量窗口。到达截止时间后，发送端会 reset 数据 Stream，接收端会 stop
+尚未读取的数据；QUIC 队列中的积压不会再通过 graceful drain 混入报告时长。
+`ThroughputReport.measurement_duration` 因而保持为配置窗口，速率只统计窗口内实际收到的
+payload。
+
+`NetBenchConfig::quick()` 的整轮硬上限为 45 秒，`standard()` 为 75 秒。
+`overall_timeout` 包含建联、路径稳定、各测量阶段和有界收尾；超时会返回带当前阶段名的
+`Error::Timeout { stage }`，并关闭专用测速 Connection。接收端也会把请求时长用于约束实际
+吞吐阶段，`max_test_duration` 不再只是请求参数校验。
+
+完整测速任务可以显式取消并等待退出：
+
+```rust,ignore
+let test = client.start(peer_addr, NetBenchConfig::quick()).await?;
+
+// 用户取消或外层操作结束时调用。
+test.cancel();
+test.abort_and_wait().await?;
+```
+
+直接丢弃 `NetBenchTest` 或仍在等待的 `run()` future，也会关闭测速 Connection 并终止内部
+任务。如果调用方必须在继续前证明任务已经退出，应使用 `abort_and_wait()`。
+
 ### 低带宽探测
 
 延迟、抖动和 Datagram 超时测量可以独立运行，不会打开吞吐 Stream：
@@ -108,6 +133,8 @@ let report = NetBenchClient::new(endpoint.clone())
 ```
 
 结果类型为 `NetBenchProbeReport`，包含连接、延迟、丢包和传输统计，不包含上传或下载结果。
+Probe 有独立的 `overall_timeout`（Quick 15 秒、Standard 25 秒），其成功或失败与完整吞吐
+测速分别记录。
 
 ### 接收端吞吐策略
 
@@ -128,8 +155,9 @@ protocol.set_throughput_policy(ThroughputPolicy::Allow);
 Standard 以及其他完整吞吐测试会在任何测量开始前返回
 `Error::ThroughputDeniedByPeer`，客户端不会静默降级测试内容。
 
-该能力复用协议 v1 现有的 `ServerLimits` 字段，不更新线协议版本。服务端在收到吞吐阶段请求时
-也会再次强制检查策略。
+该能力复用协议 v1 现有的 `ServerLimits` 字段，不更新线协议版本。固定吞吐截止和取消也保持
+`PROTOCOL_VERSION = 1`，没有增加控制消息类型。服务端在收到吞吐阶段请求时也会再次强制检查
+策略。
 
 以 A 发起测速 B 为例，控制角色在整轮测试中保持不变：
 

@@ -37,6 +37,10 @@ pub enum Error {
         stage: &'static str,
     },
 
+    /// The caller cancelled the benchmark task.
+    #[error("benchmark was cancelled")]
+    Cancelled,
+
     /// The peer allows low-bandwidth probes but denies throughput measurements.
     #[error("peer policy denies throughput measurements")]
     ThroughputDeniedByPeer,

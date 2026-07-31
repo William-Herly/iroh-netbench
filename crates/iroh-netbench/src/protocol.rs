@@ -10,7 +10,7 @@ use std::{
 
 use bytes::Bytes;
 use iroh::{
-    endpoint::{Connection, RecvStream},
+    endpoint::{Connection, ReadError, RecvStream, SendStream, VarInt, WriteError},
     protocol::{AcceptError, ProtocolHandler},
 };
 use tokio::{
@@ -30,6 +30,10 @@ use crate::{
 const DEFAULT_MAX_CHUNK_SIZE: u32 = 1024 * 1024;
 const DOWNLOAD_STREAM_MAGIC: u8 = 0x44;
 const UPLOAD_STREAM_MAGIC: u8 = 0x55;
+const THROUGHPUT_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
+const THROUGHPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+// QUIC stream application code used only to mark a normal measurement-window cutoff.
+const MEASUREMENT_COMPLETE_CODE: u32 = 0x4E42;
 
 type ConnectionObserver = Arc<dyn Fn(Connection) + Send + Sync>;
 
@@ -230,7 +234,8 @@ impl NetBenchProtocol {
         )
         .await?;
 
-        let echo_task = tokio::spawn(echo_datagrams(connection.clone()));
+        let mut background_tasks = JoinSet::new();
+        background_tasks.spawn(echo_datagrams(connection.clone()));
 
         loop {
             let message = match read_control(&mut control_recv).await {
@@ -259,38 +264,44 @@ impl NetBenchProtocol {
                     {
                         Ok(duration) => duration,
                         Err(error) => {
-                            let _ = write_control(
+                            send_error_best_effort(
                                 &mut control_send,
-                                &ControlMessage::Error {
-                                    code: ErrorCode::InvalidRequest,
-                                    message: error.to_string(),
-                                },
+                                ErrorCode::InvalidRequest,
+                                error.to_string(),
                             )
                             .await;
-                            echo_task.abort();
                             return Err(error);
                         }
                     };
-                    let download_streams =
-                        open_download_streams(connection.clone(), streams).await?;
-                    write_control(&mut control_send, &ControlMessage::TestReady { test_id })
+                    let phase_timeout = duration
+                        .saturating_add(THROUGHPUT_SETUP_TIMEOUT)
+                        .saturating_add(THROUGHPUT_CLEANUP_TIMEOUT);
+                    tokio::time::timeout(phase_timeout, async {
+                        let download_streams =
+                            open_download_streams(connection.clone(), streams).await?;
+                        write_control(&mut control_send, &ControlMessage::TestReady { test_id })
+                            .await?;
+                        expect_test_ready(&mut control_recv, test_id).await?;
+                        let (bytes, elapsed) = send_download(
+                            download_streams,
+                            duration,
+                            usize::try_from(chunk_size).map_err(Error::network)?,
+                        )
                         .await?;
-                    expect_test_ready(&mut control_recv, test_id).await?;
-                    let (bytes, elapsed) = send_download(
-                        download_streams,
-                        duration,
-                        usize::try_from(chunk_size).map_err(Error::network)?,
-                    )
-                    .await?;
-                    write_control(
-                        &mut control_send,
-                        &ControlMessage::TestFinished {
-                            test_id,
-                            received_bytes: bytes,
-                            duration_ns: duration_ns(elapsed),
-                        },
-                    )
+                        write_control(
+                            &mut control_send,
+                            &ControlMessage::TestFinished {
+                                test_id,
+                                received_bytes: bytes,
+                                duration_ns: duration_ns(elapsed),
+                            },
+                        )
+                        .await
+                    })
                     .await
+                    .map_err(|_| Error::Timeout {
+                        stage: "download phase",
+                    })?
                 }
                 ControlMessage::StartUpload {
                     test_id,
@@ -298,32 +309,44 @@ impl NetBenchProtocol {
                     streams,
                     chunk_size,
                 } => {
-                    if let Err(error) = self.validate_throughput(duration_ms, streams, chunk_size) {
-                        let _ = write_control(
+                    let duration = match self.validate_throughput(duration_ms, streams, chunk_size)
+                    {
+                        Ok(duration) => duration,
+                        Err(error) => {
+                            send_error_best_effort(
+                                &mut control_send,
+                                ErrorCode::InvalidRequest,
+                                error.to_string(),
+                            )
+                            .await;
+                            return Err(error);
+                        }
+                    };
+                    let phase_timeout = duration
+                        .saturating_add(THROUGHPUT_SETUP_TIMEOUT)
+                        .saturating_add(THROUGHPUT_CLEANUP_TIMEOUT);
+                    tokio::time::timeout(phase_timeout, async {
+                        let upload_streams =
+                            accept_upload_streams(connection.clone(), streams).await?;
+                        write_control(&mut control_send, &ControlMessage::TestReady { test_id })
+                            .await?;
+                        let (bytes, elapsed) =
+                            receive_upload(upload_streams, &mut control_send, test_id, duration)
+                                .await?;
+                        write_control(
                             &mut control_send,
-                            &ControlMessage::Error {
-                                code: ErrorCode::InvalidRequest,
-                                message: error.to_string(),
+                            &ControlMessage::TestFinished {
+                                test_id,
+                                received_bytes: bytes,
+                                duration_ns: duration_ns(elapsed),
                             },
                         )
-                        .await;
-                        echo_task.abort();
-                        return Err(error);
-                    }
-                    let upload_streams = accept_upload_streams(connection.clone(), streams).await?;
-                    write_control(&mut control_send, &ControlMessage::TestReady { test_id })
-                        .await?;
-                    let (bytes, elapsed) =
-                        receive_upload(upload_streams, &mut control_send, test_id).await?;
-                    write_control(
-                        &mut control_send,
-                        &ControlMessage::TestFinished {
-                            test_id,
-                            received_bytes: bytes,
-                            duration_ns: duration_ns(elapsed),
-                        },
-                    )
+                        .await
+                    })
                     .await
+                    .map_err(|_| Error::Timeout {
+                        stage: "upload phase",
+                    })?
                 }
                 ControlMessage::ClientHello { .. }
                 | ControlMessage::ServerHello { .. }
@@ -336,20 +359,17 @@ impl NetBenchProtocol {
             };
 
             if let Err(error) = result {
-                let _ = write_control(
+                send_error_best_effort(
                     &mut control_send,
-                    &ControlMessage::Error {
-                        code: ErrorCode::InvalidRequest,
-                        message: error.to_string(),
-                    },
+                    ErrorCode::InvalidRequest,
+                    error.to_string(),
                 )
                 .await;
-                echo_task.abort();
                 return Err(error);
             }
         }
 
-        echo_task.abort();
+        background_tasks.shutdown().await;
         Ok(())
     }
 }
@@ -359,9 +379,12 @@ impl ProtocolHandler for NetBenchProtocol {
         if let Some(observer) = &self.connection_observer {
             observer(connection.clone());
         }
-        self.handle(connection)
+        let result = self
+            .handle(connection.clone())
             .await
-            .map_err(|error| AcceptError::from_err(std::io::Error::other(error.to_string())))
+            .map_err(|error| AcceptError::from_err(std::io::Error::other(error.to_string())));
+        connection.close(0_u8.into(), b"netbench server task ended");
+        result
     }
 }
 
@@ -500,8 +523,16 @@ async fn echo_datagrams(connection: Connection) {
     }
 }
 
+async fn send_error_best_effort(control_send: &mut SendStream, code: ErrorCode, message: String) {
+    let _ = tokio::time::timeout(
+        THROUGHPUT_CLEANUP_TIMEOUT,
+        write_control(control_send, &ControlMessage::Error { code, message }),
+    )
+    .await;
+}
+
 async fn send_download(
-    streams: Vec<iroh::endpoint::SendStream>,
+    streams: Vec<SendStream>,
     duration: Duration,
     chunk_size: usize,
 ) -> Result<(u64, Duration)> {
@@ -516,20 +547,27 @@ async fn send_download(
         let chunk = Arc::clone(&chunk);
         tasks.spawn(async move {
             while Instant::now() < deadline {
-                match tokio::time::timeout_at(deadline, stream.write_all(&chunk)).await {
-                    Ok(result) => result.map_err(Error::network)?,
+                match tokio::time::timeout_at(deadline, stream.write(&chunk)).await {
+                    Ok(Ok(written)) => {
+                        total.fetch_add(written as u64, Ordering::Relaxed);
+                    }
+                    Ok(Err(WriteError::Stopped(code))) if code == measurement_complete_code() => {
+                        break;
+                    }
+                    Ok(Err(error)) => return Err(Error::network(error)),
                     Err(_) => break,
                 }
-                total.fetch_add(chunk.len() as u64, Ordering::Relaxed);
             }
-            stream.finish().map_err(Error::network)
+            let _ = stream.reset(measurement_complete_code());
+            Result::<()>::Ok(())
         });
     }
 
     while let Some(result) = tasks.join_next().await {
         result.map_err(Error::network)??;
     }
-    Ok((total.load(Ordering::Relaxed), started.elapsed()))
+    tokio::time::sleep_until(deadline).await;
+    Ok((total.load(Ordering::Relaxed), duration))
 }
 
 async fn open_download_streams(
@@ -581,20 +619,32 @@ async fn accept_upload_streams(connection: Connection, streams: u16) -> Result<V
 
 async fn receive_upload(
     streams: Vec<RecvStream>,
-    control_send: &mut iroh::endpoint::SendStream,
+    control_send: &mut SendStream,
     test_id: u64,
+    duration: Duration,
 ) -> Result<(u64, Duration)> {
     let total = Arc::new(AtomicU64::new(0));
     let mut tasks = JoinSet::new();
 
     let started = Instant::now();
+    let deadline = started + duration;
     for mut stream in streams {
         let total = Arc::clone(&total);
         tasks.spawn(async move {
             let mut buffer = vec![0_u8; 64 * 1024];
-            while let Some(read) = stream.read(&mut buffer).await.map_err(Error::network)? {
-                total.fetch_add(read as u64, Ordering::Relaxed);
+            while Instant::now() < deadline {
+                match tokio::time::timeout_at(deadline, stream.read(&mut buffer)).await {
+                    Ok(Ok(Some(read))) if Instant::now() <= deadline => {
+                        total.fetch_add(read as u64, Ordering::Relaxed);
+                    }
+                    Ok(Ok(Some(_) | None)) | Err(_) => break,
+                    Ok(Err(ReadError::Reset(code))) if code == measurement_complete_code() => {
+                        break;
+                    }
+                    Ok(Err(error)) => return Err(Error::network(error)),
+                }
             }
+            let _ = stream.stop(measurement_complete_code());
             Result::<()>::Ok(())
         });
     }
@@ -609,19 +659,30 @@ async fn receive_upload(
                 }
             }
             _ = ticker.tick() => {
-                write_control(
-                    control_send,
-                    &ControlMessage::ThroughputProgress {
-                        test_id,
-                        received_bytes: total.load(Ordering::Relaxed),
-                        duration_ns: duration_ns(started.elapsed()),
-                    },
+                tokio::time::timeout_at(
+                    deadline + THROUGHPUT_CLEANUP_TIMEOUT,
+                    write_control(
+                        control_send,
+                        &ControlMessage::ThroughputProgress {
+                            test_id,
+                            received_bytes: total.load(Ordering::Relaxed),
+                            duration_ns: duration_ns(started.elapsed().min(duration)),
+                        },
+                    ),
                 )
-                .await?;
+                .await
+                .map_err(|_| Error::Timeout {
+                    stage: "upload progress",
+                })??;
             }
         }
     }
-    Ok((total.load(Ordering::Relaxed), started.elapsed()))
+    tokio::time::sleep_until(deadline).await;
+    Ok((total.load(Ordering::Relaxed), duration))
+}
+
+fn measurement_complete_code() -> VarInt {
+    MEASUREMENT_COMPLETE_CODE.into()
 }
 
 fn duration_ms(duration: Duration) -> u32 {
@@ -635,6 +696,54 @@ fn duration_ns(duration: Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iroh::{Endpoint, RelayMode, endpoint::presets, protocol::Router};
+
+    const DOWNLOAD_DEADLINE_ALPN: &[u8] = b"/iroh/netbench/test/download-deadline";
+    const UPLOAD_DEADLINE_ALPN: &[u8] = b"/iroh/netbench/test/upload-deadline";
+
+    #[derive(Debug, Clone)]
+    struct DownloadDeadlineProtocol {
+        completed: tokio::sync::mpsc::UnboundedSender<Duration>,
+    }
+
+    impl ProtocolHandler for DownloadDeadlineProtocol {
+        async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+            let stream = connection.open_uni().await?;
+            let started = Instant::now();
+            send_download(vec![stream], Duration::from_millis(100), 64 * 1024)
+                .await
+                .map_err(AcceptError::from_err)?;
+            let _ = self.completed.send(started.elapsed());
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            connection.close(0_u8.into(), b"download deadline test complete");
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct UploadDeadlineProtocol {
+        completed: tokio::sync::mpsc::UnboundedSender<Duration>,
+    }
+
+    impl ProtocolHandler for UploadDeadlineProtocol {
+        async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+            let (mut control_send, _control_recv) = connection.accept_bi().await?;
+            let stream = connection.accept_uni().await?;
+            let started = Instant::now();
+            receive_upload(
+                vec![stream],
+                &mut control_send,
+                1,
+                Duration::from_millis(100),
+            )
+            .await
+            .map_err(AcceptError::from_err)?;
+            let _ = self.completed.send(started.elapsed());
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            connection.close(0_u8.into(), b"upload deadline test complete");
+            Ok(())
+        }
+    }
 
     #[test]
     fn denied_throughput_is_advertised_and_enforced_without_blocking_probes() {
@@ -648,5 +757,112 @@ mod tests {
             protocol.validate_throughput(1_000, 1, 1_024),
             Err(Error::ThroughputDeniedByPeer)
         ));
+    }
+
+    #[tokio::test]
+    async fn download_deadline_resets_queued_data_instead_of_draining() {
+        let server = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let router = Router::builder(server.clone())
+            .accept(
+                DOWNLOAD_DEADLINE_ALPN,
+                DownloadDeadlineProtocol {
+                    completed: completed_tx,
+                },
+            )
+            .spawn();
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let connection = client
+            .connect(server.addr(), DOWNLOAD_DEADLINE_ALPN)
+            .await
+            .unwrap();
+        let mut stream = connection.accept_uni().await.unwrap();
+
+        let elapsed = tokio::time::timeout(Duration::from_secs(1), completed_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(elapsed < Duration::from_millis(300));
+        let mut buffer = vec![0_u8; 64 * 1024];
+        let reset_code = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match stream.read(&mut buffer).await {
+                    Ok(Some(_)) => {}
+                    Ok(None) => panic!("download ended with graceful EOF instead of reset"),
+                    Err(ReadError::Reset(code)) => break code,
+                    Err(error) => panic!("unexpected download reader error: {error}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(reset_code, measurement_complete_code());
+
+        connection.close(0_u8.into(), b"download deadline assertion complete");
+        router.shutdown().await.unwrap();
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn upload_deadline_stops_a_sender_that_never_finishes() {
+        let server = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+        let router = Router::builder(server.clone())
+            .accept(
+                UPLOAD_DEADLINE_ALPN,
+                UploadDeadlineProtocol {
+                    completed: completed_tx,
+                },
+            )
+            .spawn();
+        let client = Endpoint::builder(presets::Minimal)
+            .relay_mode(RelayMode::Disabled)
+            .bind()
+            .await
+            .unwrap();
+        let connection = client
+            .connect(server.addr(), UPLOAD_DEADLINE_ALPN)
+            .await
+            .unwrap();
+        let (mut control_send, _control_recv) = connection.open_bi().await.unwrap();
+        control_send.write_all(&[0]).await.unwrap();
+        let mut stream = connection.open_uni().await.unwrap();
+        let writer = tokio::spawn(async move {
+            let chunk = vec![0x5A; 64 * 1024];
+            loop {
+                match stream.write(&chunk).await {
+                    Ok(_) => {}
+                    Err(WriteError::Stopped(code)) => break code,
+                    Err(error) => panic!("unexpected upload writer error: {error}"),
+                }
+            }
+        });
+
+        let elapsed = tokio::time::timeout(Duration::from_secs(1), completed_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(elapsed < Duration::from_millis(300));
+        let stop_code = tokio::time::timeout(Duration::from_secs(1), writer)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stop_code, measurement_complete_code());
+
+        connection.close(0_u8.into(), b"upload deadline assertion complete");
+        router.shutdown().await.unwrap();
+        client.close().await;
     }
 }

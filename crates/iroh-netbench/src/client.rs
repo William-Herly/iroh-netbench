@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -12,11 +12,11 @@ use std::{
 use bytes::Bytes;
 use iroh::{
     Endpoint, EndpointAddr, TransportAddr,
-    endpoint::{Connection, PathStats, RecvStream, SendStream},
+    endpoint::{Connection, PathStats, ReadError, RecvStream, SendStream, VarInt, WriteError},
 };
 use tokio::{
-    sync::{mpsc, oneshot},
-    task::JoinSet,
+    sync::mpsc,
+    task::{AbortHandle, JoinHandle, JoinSet},
     time::{Instant, MissedTickBehavior},
 };
 
@@ -32,6 +32,10 @@ use crate::{
 };
 
 type ConnectionObserver = Arc<dyn Fn(Connection) + Send + Sync>;
+
+const THROUGHPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
+// QUIC stream application code used only to mark a normal measurement-window cutoff.
+const MEASUREMENT_COMPLETE_CODE: u32 = 0x4E42;
 
 /// Starts benchmark connections from an existing long-lived endpoint.
 #[derive(Clone)]
@@ -191,14 +195,21 @@ impl NetBenchClient {
         config: NetBenchProbeConfig,
     ) -> Result<NetBenchProbeReport> {
         let (event_tx, _event_rx) = mpsc::channel(128);
-        run_probe_benchmark(
-            self.endpoint.clone(),
-            peer,
-            config,
-            &EventSink(event_tx),
-            self.connection_observer.as_ref(),
+        let overall_timeout = config.overall_timeout;
+        tokio::time::timeout(
+            overall_timeout,
+            run_probe_benchmark(
+                self.endpoint.clone(),
+                peer,
+                config,
+                &EventSink(event_tx),
+                self.connection_observer.as_ref(),
+            ),
         )
         .await
+        .map_err(|_| Error::Timeout {
+            stage: "probe benchmark",
+        })?
     }
 
     /// Starts a benchmark and returns an event stream plus final result handle.
@@ -212,28 +223,48 @@ impl NetBenchClient {
     )]
     pub async fn start(&self, peer: EndpointAddr, config: NetBenchConfig) -> Result<NetBenchTest> {
         let (event_tx, event_rx) = mpsc::channel(128);
-        let (result_tx, result_rx) = oneshot::channel();
         let endpoint = self.endpoint.clone();
         let connection_observer = self.connection_observer.clone();
         let events = EventSink(event_tx);
-        tokio::spawn(async move {
-            let result = run_benchmark(
-                endpoint,
-                peer,
-                config,
-                &events,
-                connection_observer.as_ref(),
+        let overall_timeout = config.overall_timeout;
+        let active_connection = ActiveConnection::default();
+        let task_connection = active_connection.clone();
+        let stage = BenchmarkStage::default();
+        let task_stage = stage.clone();
+        let task = tokio::spawn(async move {
+            let result = if let Ok(result) = tokio::time::timeout(
+                overall_timeout,
+                run_benchmark(
+                    endpoint,
+                    peer,
+                    config,
+                    &events,
+                    connection_observer.as_ref(),
+                    &task_connection,
+                    &task_stage,
+                ),
             )
-            .await;
+            .await
+            {
+                result
+            } else {
+                task_connection.close(b"netbench overall timeout");
+                Err(Error::Timeout {
+                    stage: task_stage.current(),
+                })
+            };
             if let Ok(report) = &result {
                 events.send(NetBenchEvent::Finished(report.clone()));
             }
-            let _ = result_tx.send(result);
+            result
         });
+        let abort = task.abort_handle();
 
         Ok(NetBenchTest {
             events: event_rx,
-            result: result_rx,
+            task: Some(task),
+            abort,
+            active_connection,
         })
     }
 }
@@ -242,7 +273,9 @@ impl NetBenchClient {
 #[derive(Debug)]
 pub struct NetBenchTest {
     events: mpsc::Receiver<NetBenchEvent>,
-    result: oneshot::Receiver<Result<NetBenchReport>>,
+    task: Option<JoinHandle<Result<NetBenchReport>>>,
+    abort: AbortHandle,
+    active_connection: ActiveConnection,
 }
 
 impl NetBenchTest {
@@ -251,16 +284,112 @@ impl NetBenchTest {
         self.events.recv().await
     }
 
+    /// Cancels the benchmark and closes its dedicated connection immediately.
+    ///
+    /// Call [`Self::abort_and_wait`] when the caller must prove that the internal task has exited.
+    pub fn cancel(&self) {
+        self.active_connection.close(b"netbench cancelled");
+        self.abort.abort();
+    }
+
+    /// Returns whether the internal benchmark task has finished.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.task.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    /// Cancels the benchmark and waits until its internal task has exited.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task panicked while cancellation was racing with completion.
+    pub async fn abort_and_wait(mut self) -> Result<()> {
+        self.cancel();
+        let Some(task) = self.task.take() else {
+            return Ok(());
+        };
+        match task.await {
+            Ok(_) => Ok(()),
+            Err(error) if error.is_cancelled() => Ok(()),
+            Err(error) => Err(Error::Protocol(format!(
+                "benchmark task failed while being cancelled: {error}"
+            ))),
+        }
+    }
+
     /// Waits for the final report.
     ///
     /// # Errors
     ///
     /// Returns the terminal error from the benchmark task.
-    pub async fn result(self) -> Result<NetBenchReport> {
-        self.result
-            .await
-            .map_err(|_| Error::Protocol("benchmark task ended without a result".to_owned()))?
+    pub async fn result(mut self) -> Result<NetBenchReport> {
+        let task = self
+            .task
+            .take()
+            .ok_or_else(|| Error::Protocol("benchmark result was already consumed".to_owned()))?;
+        match task.await {
+            Ok(result) => result,
+            Err(error) if error.is_cancelled() => Err(Error::Cancelled),
+            Err(error) => Err(Error::Protocol(format!(
+                "benchmark task ended without a result: {error}"
+            ))),
+        }
     }
+}
+
+impl Drop for NetBenchTest {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct ActiveConnection(Arc<Mutex<Option<Connection>>>);
+
+impl ActiveConnection {
+    fn register(&self, connection: &Connection) -> ActiveConnectionGuard {
+        *lock_unpoisoned(&self.0) = Some(connection.clone());
+        ActiveConnectionGuard(self.clone())
+    }
+
+    fn close(&self, reason: &'static [u8]) {
+        if let Some(connection) = lock_unpoisoned(&self.0).take() {
+            connection.close(0_u8.into(), reason);
+        }
+    }
+}
+
+struct ActiveConnectionGuard(ActiveConnection);
+
+impl Drop for ActiveConnectionGuard {
+    fn drop(&mut self) {
+        self.0.close(b"netbench task ended");
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BenchmarkStage(Arc<Mutex<&'static str>>);
+
+impl Default for BenchmarkStage {
+    fn default() -> Self {
+        Self(Arc::new(Mutex::new("connection setup")))
+    }
+}
+
+impl BenchmarkStage {
+    fn set(&self, stage: &'static str) {
+        *lock_unpoisoned(&self.0) = stage;
+    }
+
+    fn current(&self) -> &'static str {
+        *lock_unpoisoned(&self.0)
+    }
+}
+
+fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[derive(Clone)]
@@ -282,6 +411,8 @@ async fn run_benchmark(
     config: NetBenchConfig,
     events: &EventSink,
     connection_observer: Option<&ConnectionObserver>,
+    active_connection: &ActiveConnection,
+    stage: &BenchmarkStage,
 ) -> Result<NetBenchReport> {
     let total_started = Instant::now();
     events.send(NetBenchEvent::Connecting);
@@ -296,6 +427,7 @@ async fn run_benchmark(
         .connect(peer, NETBENCH_ALPN)
         .await
         .map_err(Error::network)?;
+    let _connection_guard = active_connection.register(&connection);
     if let Some(observer) = connection_observer {
         observer(connection.clone());
     }
@@ -307,6 +439,7 @@ async fn run_benchmark(
     ));
     let peer_id = connection.remote_id();
 
+    stage.set("protocol negotiation");
     let (mut control_send, mut control_recv) =
         connection.open_bi().await.map_err(Error::network)?;
     events.send(NetBenchEvent::ConnectionStage(
@@ -353,6 +486,7 @@ async fn run_benchmark(
     }
     validate_against_server_limits(&config, limits)?;
 
+    stage.set("path stabilization");
     let (initial_path, time_to_direct) = stabilize_path(
         &connection,
         config.path_stabilization_timeout,
@@ -369,6 +503,7 @@ async fn run_benchmark(
     let before = TransportSnapshot::capture(&connection);
     let mut test_id = 1_u64;
 
+    stage.set("idle latency");
     events.send(NetBenchEvent::LatencyStarted);
     write_control(
         &mut control_send,
@@ -392,6 +527,7 @@ async fn run_benchmark(
     let idle_latency = latency_report(&idle.rtts);
     test_id += 1;
 
+    stage.set("loss probes");
     events.send(NetBenchEvent::LossStarted);
     write_control(
         &mut control_send,
@@ -419,6 +555,7 @@ async fn run_benchmark(
     test_id += 1;
 
     if !config.download_warmup.is_zero() {
+        stage.set("download warm-up");
         events.send(NetBenchEvent::DownloadWarmupStarted);
         let _ = download_phase(
             &connection,
@@ -434,6 +571,7 @@ async fn run_benchmark(
         test_id += 1;
     }
 
+    stage.set("download throughput");
     events.send(NetBenchEvent::DownloadStarted);
     let download_future = download_phase(
         &connection,
@@ -457,6 +595,7 @@ async fn run_benchmark(
     test_id += 1;
 
     if !config.upload_warmup.is_zero() {
+        stage.set("upload warm-up");
         events.send(NetBenchEvent::UploadWarmupStarted);
         if !matches!(
             selected_path_kind(&connection),
@@ -484,6 +623,7 @@ async fn run_benchmark(
         test_id += 1;
     }
 
+    stage.set("upload throughput");
     events.send(NetBenchEvent::UploadStarted);
     let upload_future = upload_phase(
         &connection,
@@ -505,8 +645,9 @@ async fn run_benchmark(
     );
     let (upload, upload_loaded) = tokio::try_join!(upload_future, upload_probe_future)?;
 
+    stage.set("finalization");
     let after = TransportSnapshot::capture(&connection);
-    path_monitor.abort();
+    path_monitor.abort_and_wait().await;
     let final_path = selected_path_kind(&connection);
     let path = if initial_path == final_path {
         final_path
@@ -571,6 +712,8 @@ async fn run_probe_benchmark(
         .connect(peer, NETBENCH_ALPN)
         .await
         .map_err(Error::network)?;
+    let probe_connection = ActiveConnection::default();
+    let _connection_guard = probe_connection.register(&connection);
     if let Some(observer) = connection_observer {
         observer(connection.clone());
     }
@@ -692,7 +835,7 @@ async fn run_probe_benchmark(
     let loss = loss_samples.loss_report();
 
     let after = TransportSnapshot::capture(&connection);
-    path_monitor.abort();
+    path_monitor.abort_and_wait().await;
     let final_path = selected_path_kind(&connection);
     let path = if initial_path == final_path {
         final_path
@@ -934,10 +1077,15 @@ async fn measure_probes(
                     kind: ProbeKind::Request,
                 };
                 let payload = postcard::to_allocvec(&probe)?;
-                connection
-                    .send_datagram_wait(Bytes::from(payload))
-                    .await
-                    .map_err(Error::network)?;
+                match tokio::time::timeout_at(
+                    send_deadline,
+                    connection.send_datagram_wait(Bytes::from(payload)),
+                )
+                .await
+                {
+                    Ok(result) => result.map_err(Error::network)?,
+                    Err(_) => break,
+                }
                 sent_at.insert(sequence, Instant::now());
                 sequence += 1;
             }
@@ -1034,6 +1182,7 @@ async fn download_phase(
     write_control(control_send, &ControlMessage::TestReady { test_id }).await?;
 
     let started = Instant::now();
+    let deadline = started + duration;
     let sample_task = spawn_sampler(
         Arc::clone(&total),
         started,
@@ -1045,20 +1194,37 @@ async fn download_phase(
         let total = Arc::clone(&total);
         tasks.spawn(async move {
             let mut buffer = vec![0_u8; 64 * 1024];
-            while let Some(read) = stream.read(&mut buffer).await.map_err(Error::network)? {
-                total.fetch_add(read as u64, Ordering::Relaxed);
+            while Instant::now() < deadline {
+                match tokio::time::timeout_at(deadline, stream.read(&mut buffer)).await {
+                    Ok(Ok(Some(read))) if Instant::now() <= deadline => {
+                        total.fetch_add(read as u64, Ordering::Relaxed);
+                    }
+                    Ok(Ok(Some(_) | None)) | Err(_) => break,
+                    Ok(Err(ReadError::Reset(code))) if code == measurement_complete_code() => {
+                        break;
+                    }
+                    Ok(Err(error)) => return Err(Error::network(error)),
+                }
             }
+            let _ = stream.stop(measurement_complete_code());
             Result::<()>::Ok(())
         });
     }
     while let Some(result) = tasks.join_next().await {
         result.map_err(Error::network)??;
     }
-    sample_task.abort();
-    let elapsed = started.elapsed();
+    tokio::time::sleep_until(deadline).await;
+    sample_task.abort_and_wait().await;
     let bytes = total.load(Ordering::Relaxed);
-    expect_finished(control_recv, test_id).await?;
-    Ok(throughput_report(bytes, elapsed, streams))
+    tokio::time::timeout(
+        THROUGHPUT_CLEANUP_TIMEOUT,
+        expect_finished(control_recv, test_id),
+    )
+    .await
+    .map_err(|_| Error::Timeout {
+        stage: "download cleanup",
+    })??;
+    Ok(throughput_report(bytes, duration, streams))
 }
 
 #[allow(
@@ -1107,81 +1273,84 @@ async fn upload_phase(
         let chunk = Arc::clone(&chunk);
         tasks.spawn(async move {
             while Instant::now() < deadline {
-                match tokio::time::timeout_at(deadline, stream.write_all(&chunk)).await {
-                    Ok(result) => result.map_err(Error::network)?,
+                match tokio::time::timeout_at(deadline, stream.write(&chunk)).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(WriteError::Stopped(code))) if code == measurement_complete_code() => {
+                        break;
+                    }
+                    Ok(Err(error)) => return Err(Error::network(error)),
                     Err(_) => break,
                 }
             }
-            stream.finish().map_err(Error::network)
+            let _ = stream.reset(measurement_complete_code());
+            Result::<()>::Ok(())
         });
     }
     let mut progress = VecDeque::<(Duration, u64)>::from([(Duration::ZERO, 0)]);
-    let (received_bytes, receiver_duration) = loop {
-        tokio::select! {
-            result = tasks.join_next(), if !tasks.is_empty() => {
-                if let Some(result) = result {
-                    result.map_err(Error::network)??;
+    let cleanup_deadline = deadline + THROUGHPUT_CLEANUP_TIMEOUT;
+    let received_bytes = loop {
+        let message = tokio::time::timeout_at(cleanup_deadline, read_control(control_recv))
+            .await
+            .map_err(|_| Error::Timeout {
+                stage: "upload cleanup",
+            })??;
+        match message {
+            ControlMessage::ThroughputProgress {
+                test_id: received_test_id,
+                received_bytes,
+                duration_ns,
+            } if received_test_id == test_id => {
+                let receiver_elapsed = Duration::from_nanos(duration_ns).min(duration);
+                progress.push_back((receiver_elapsed, received_bytes));
+                while progress.len() > 5 {
+                    progress.pop_front();
+                }
+                let (old_elapsed, old_bytes) = progress.front().copied().unwrap_or_default();
+                let sample_duration = receiver_elapsed.saturating_sub(old_elapsed);
+                let interval_bps = if sample_duration.is_zero() {
+                    0.0
+                } else {
+                    received_bytes.saturating_sub(old_bytes) as f64 * 8.0
+                        / sample_duration.as_secs_f64()
+                };
+                if let Some(events) = &events {
+                    events.send(NetBenchEvent::UploadSample(ThroughputSample {
+                        direction: ThroughputDirection::Upload,
+                        elapsed: receiver_elapsed,
+                        received_bytes,
+                        interval_bps,
+                    }));
                 }
             }
-            message = read_control(control_recv) => {
-                match message? {
-                    ControlMessage::ThroughputProgress {
-                        test_id: received_test_id,
-                        received_bytes,
-                        duration_ns,
-                    } if received_test_id == test_id => {
-                        let receiver_elapsed = Duration::from_nanos(duration_ns);
-                        progress.push_back((receiver_elapsed, received_bytes));
-                        while progress.len() > 5 {
-                            progress.pop_front();
-                        }
-                        let (old_elapsed, old_bytes) = progress.front().copied().unwrap_or_default();
-                        let sample_duration = receiver_elapsed.saturating_sub(old_elapsed);
-                        let interval_bps = if sample_duration.is_zero() {
-                            0.0
-                        } else {
-                            received_bytes.saturating_sub(old_bytes) as f64 * 8.0
-                                / sample_duration.as_secs_f64()
-                        };
-                        if let Some(events) = &events {
-                            events.send(NetBenchEvent::UploadSample(ThroughputSample {
-                                direction: ThroughputDirection::Upload,
-                                elapsed: receiver_elapsed,
-                                received_bytes,
-                                interval_bps,
-                            }));
-                        }
-                    }
-                    ControlMessage::TestFinished {
-                        test_id: received_test_id,
-                        received_bytes,
-                        duration_ns,
-                    } if received_test_id == test_id => {
-                        break (received_bytes, Duration::from_nanos(duration_ns));
-                    }
-                    ControlMessage::Error { code, message } => {
-                        return Err(Error::Peer {
-                            code: code as u16,
-                            message,
-                        });
-                    }
-                    message => {
-                        return Err(Error::Protocol(format!(
-                            "expected upload progress or completion, received {message:?}"
-                        )));
-                    }
-                }
+            ControlMessage::TestFinished {
+                test_id: received_test_id,
+                received_bytes,
+                ..
+            } if received_test_id == test_id => break received_bytes,
+            ControlMessage::Error { code, message } => {
+                return Err(Error::Peer {
+                    code: code as u16,
+                    message,
+                });
+            }
+            message => {
+                return Err(Error::Protocol(format!(
+                    "expected upload progress or completion, received {message:?}"
+                )));
             }
         }
     };
-    while let Some(result) = tasks.join_next().await {
-        result.map_err(Error::network)??;
-    }
-    Ok(throughput_report(
-        received_bytes,
-        receiver_duration,
-        streams,
-    ))
+    tokio::time::timeout_at(cleanup_deadline, async {
+        while let Some(result) = tasks.join_next().await {
+            result.map_err(Error::network)??;
+        }
+        Result::<()>::Ok(())
+    })
+    .await
+    .map_err(|_| Error::Timeout {
+        stage: "upload stream cleanup",
+    })??;
+    Ok(throughput_report(received_bytes, duration, streams))
 }
 
 async fn expect_ready(control_recv: &mut RecvStream, expected_test_id: u64) -> Result<()> {
@@ -1209,8 +1378,8 @@ fn spawn_sampler(
     started: Instant,
     direction: ThroughputDirection,
     events: Option<EventSink>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> AbortOnDropTask<()> {
+    AbortOnDropTask::new(tokio::spawn(async move {
         let Some(events) = events else {
             return;
         };
@@ -1249,11 +1418,11 @@ fn spawn_sampler(
                 }),
             });
         }
-    })
+    }))
 }
 
-fn spawn_path_monitor(connection: Connection, events: EventSink) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+fn spawn_path_monitor(connection: Connection, events: EventSink) -> AbortOnDropTask<()> {
+    AbortOnDropTask::new(tokio::spawn(async move {
         let mut previous = selected_path_kind(&connection);
         let mut ticker = tokio::time::interval(Duration::from_millis(250));
         loop {
@@ -1269,7 +1438,31 @@ fn spawn_path_monitor(connection: Connection, events: EventSink) -> tokio::task:
                 previous = current;
             }
         }
-    })
+    }))
+}
+
+#[derive(Debug)]
+struct AbortOnDropTask<T>(Option<JoinHandle<T>>);
+
+impl<T> AbortOnDropTask<T> {
+    fn new(task: JoinHandle<T>) -> Self {
+        Self(Some(task))
+    }
+
+    async fn abort_and_wait(mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+}
+
+impl<T> Drop for AbortOnDropTask<T> {
+    fn drop(&mut self) {
+        if let Some(task) = &self.0 {
+            task.abort();
+        }
+    }
 }
 
 async fn expect_finished(recv: &mut RecvStream, expected_test_id: u64) -> Result<(u64, Duration)> {
@@ -1319,6 +1512,10 @@ fn selected_path_kind(connection: &Connection) -> PathKind {
         TransportAddr::Ip(_) => PathKind::Direct,
         _ => PathKind::Unknown,
     }
+}
+
+fn measurement_complete_code() -> VarInt {
+    MEASUREMENT_COMPLETE_CODE.into()
 }
 
 #[derive(Clone, Copy, Default)]

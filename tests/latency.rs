@@ -22,4 +22,6 @@ fn probe_presets_match_full_latency_and_loss_settings() {
     assert_eq!(probes.loss_duration, full.loss_duration);
     assert_eq!(probes.loss_rate_per_second, full.loss_rate_per_second);
     assert_eq!(probes.probe_timeout, full.probe_timeout);
+    assert_eq!(probes.overall_timeout, Duration::from_secs(15));
+    assert!(probes.overall_timeout < full.overall_timeout);
 }

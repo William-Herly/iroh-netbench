@@ -5,6 +5,8 @@ use std::time::Duration;
 /// Parameters for one complete benchmark run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetBenchConfig {
+    /// Hard wall-clock limit for the complete benchmark, including connection setup and cleanup.
+    pub overall_timeout: Duration,
     /// Maximum time to wait for a direct path before measurements begin.
     pub path_stabilization_timeout: Duration,
     /// Idle RTT measurement duration.
@@ -39,6 +41,8 @@ pub struct NetBenchConfig {
 /// bandwidth-saturating measurements.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetBenchProbeConfig {
+    /// Hard wall-clock limit for the complete low-bandwidth probe run.
+    pub overall_timeout: Duration,
     /// Maximum time to wait for a direct path before measurements begin.
     pub path_stabilization_timeout: Duration,
     /// Idle RTT measurement duration.
@@ -58,6 +62,7 @@ impl NetBenchConfig {
     #[must_use]
     pub fn quick() -> Self {
         Self {
+            overall_timeout: Duration::from_secs(45),
             path_stabilization_timeout: Duration::from_secs(3),
             latency_duration: Duration::from_secs(2),
             latency_interval: Duration::from_millis(100),
@@ -78,6 +83,7 @@ impl NetBenchConfig {
     #[must_use]
     pub fn standard() -> Self {
         Self {
+            overall_timeout: Duration::from_secs(75),
             latency_duration: Duration::from_secs(3),
             loss_duration: Duration::from_secs(5),
             download_warmup: Duration::from_secs(2),
@@ -100,20 +106,27 @@ impl NetBenchProbeConfig {
     #[must_use]
     pub fn quick() -> Self {
         let full = NetBenchConfig::quick();
-        Self::from(&full)
+        Self {
+            overall_timeout: Duration::from_secs(15),
+            ..Self::from(&full)
+        }
     }
 
     /// A longer low-bandwidth diagnostic preset.
     #[must_use]
     pub fn standard() -> Self {
         let full = NetBenchConfig::standard();
-        Self::from(&full)
+        Self {
+            overall_timeout: Duration::from_secs(25),
+            ..Self::from(&full)
+        }
     }
 }
 
 impl From<&NetBenchConfig> for NetBenchProbeConfig {
     fn from(config: &NetBenchConfig) -> Self {
         Self {
+            overall_timeout: config.overall_timeout,
             path_stabilization_timeout: config.path_stabilization_timeout,
             latency_duration: config.latency_duration,
             latency_interval: config.latency_interval,

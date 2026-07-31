@@ -99,6 +99,33 @@ let report = test.result().await?;
 connection. One benchmark connection contains a control stream, parallel upload/download streams
 and Datagram probes.
 
+### Bounded duration and cancellation
+
+Throughput durations are fixed accounting windows. At the deadline, the sender resets its data
+streams and the receiver stops unread data; queued QUIC data is not gracefully drained into the
+reported duration. `ThroughputReport.measurement_duration` therefore remains the configured
+window, while only payload received inside that window contributes to the rate.
+
+`NetBenchConfig::quick()` has a 45-second overall hard limit and `standard()` has a 75-second
+limit. `overall_timeout` includes connection setup, path stabilization, measurements and bounded
+cleanup. A timeout returns `Error::Timeout { stage }` and closes the dedicated benchmark
+connection. The receiver also applies the requested duration as a runtime limit; its
+`max_test_duration` is not only request validation.
+
+A running full benchmark can be stopped explicitly and joined:
+
+```rust,ignore
+let test = client.start(peer_addr, NetBenchConfig::quick()).await?;
+
+// Called when the user cancels or an outer operation is being torn down.
+test.cancel();
+test.abort_and_wait().await?;
+```
+
+Dropping `NetBenchTest` or a pending `run()` future also closes the benchmark connection and
+aborts its internal tasks. Use `abort_and_wait()` when the caller must prove task termination
+before continuing.
+
 ### Low-bandwidth probes
 
 Latency, jitter and Datagram timeout measurements can run without opening throughput streams:
@@ -112,7 +139,8 @@ let report = NetBenchClient::new(endpoint.clone())
 ```
 
 The result is a `NetBenchProbeReport` with connection, latency, loss and transport data, but no
-upload or download result.
+upload or download result. Probe presets have their own `overall_timeout` (15 seconds for Quick,
+25 seconds for Standard) and remain separate from full-throughput success or failure.
 
 ### Receiver throughput policy
 
@@ -135,7 +163,9 @@ protocol.set_throughput_policy(ThroughputPolicy::Allow);
 the requested test.
 
 This reuses the existing protocol-v1 `ServerLimits` fields and does not change the wire protocol
-version. The server also enforces the policy when a throughput phase is requested.
+version. Fixed throughput deadlines and cancellation likewise keep `PROTOCOL_VERSION = 1` and do
+not add control-message variants. The server also enforces the policy when a throughput phase is
+requested.
 
 For a run initiated by A against B, the control roles remain fixed:
 
