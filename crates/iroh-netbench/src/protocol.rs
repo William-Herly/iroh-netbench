@@ -21,6 +21,9 @@ use tokio::{
 
 use crate::{
     Error, PROTOCOL_VERSION, Result, SessionMonitor,
+    scheduling::{
+        THROUGHPUT_CLEANUP_TIMEOUT, deprioritize_throughput_stream, prioritize_control_stream,
+    },
     wire::{
         Capabilities, ControlMessage, ErrorCode, Probe, ProbeKind, ServerLimits, read_control,
         write_control,
@@ -31,7 +34,6 @@ const DEFAULT_MAX_CHUNK_SIZE: u32 = 1024 * 1024;
 const DOWNLOAD_STREAM_MAGIC: u8 = 0x44;
 const UPLOAD_STREAM_MAGIC: u8 = 0x55;
 const THROUGHPUT_SETUP_TIMEOUT: Duration = Duration::from_secs(5);
-const THROUGHPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 // QUIC stream application code used only to mark a normal measurement-window cutoff.
 const MEASUREMENT_COMPLETE_CODE: u32 = 0x4E42;
 
@@ -183,6 +185,7 @@ impl NetBenchProtocol {
         let permit = Arc::clone(&self.permits).try_acquire_owned();
         let (mut control_send, mut control_recv) =
             connection.accept_bi().await.map_err(Error::network)?;
+        prioritize_control_stream(&control_send)?;
 
         let Ok(_permit) = permit else {
             write_control(
@@ -288,6 +291,13 @@ impl NetBenchProtocol {
                             usize::try_from(chunk_size).map_err(Error::network)?,
                         )
                         .await?;
+                        tracing::debug!(
+                            test_id,
+                            direction = "download",
+                            received_bytes = bytes,
+                            measurement_duration = ?elapsed,
+                            "throughput data tasks completed; queueing completion on the prioritized control stream"
+                        );
                         write_control(
                             &mut control_send,
                             &ControlMessage::TestFinished {
@@ -333,6 +343,13 @@ impl NetBenchProtocol {
                         let (bytes, elapsed) =
                             receive_upload(upload_streams, &mut control_send, test_id, duration)
                                 .await?;
+                        tracing::debug!(
+                            test_id,
+                            direction = "upload",
+                            received_bytes = bytes,
+                            measurement_duration = ?elapsed,
+                            "throughput data tasks completed; queueing completion on the prioritized control stream"
+                        );
                         write_control(
                             &mut control_send,
                             &ControlMessage::TestFinished {
@@ -577,6 +594,7 @@ async fn open_download_streams(
     let mut opened = Vec::with_capacity(usize::from(streams));
     for _ in 0..streams {
         let mut stream = connection.open_uni().await.map_err(Error::network)?;
+        deprioritize_throughput_stream(&stream)?;
         stream
             .write_all(&[DOWNLOAD_STREAM_MAGIC])
             .await

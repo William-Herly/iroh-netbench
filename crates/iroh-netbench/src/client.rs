@@ -25,6 +25,9 @@ use crate::{
     LossReport, LossSample, NETBENCH_ALPN, NetBenchConfig, NetBenchEvent, NetBenchProbeConfig,
     NetBenchProbeReport, NetBenchReport, PROTOCOL_VERSION, PathKind, Result, SCHEMA_VERSION,
     SessionMonitor, ThroughputDirection, ThroughputReport, ThroughputSample, TransportReport,
+    scheduling::{
+        THROUGHPUT_CLEANUP_TIMEOUT, deprioritize_throughput_stream, prioritize_control_stream,
+    },
     statistics::latency_report,
     wire::{
         Capabilities, ControlMessage, PROBE_MAGIC, Probe, ProbeKind, read_control, write_control,
@@ -33,7 +36,6 @@ use crate::{
 
 type ConnectionObserver = Arc<dyn Fn(Connection) + Send + Sync>;
 
-const THROUGHPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(2);
 // QUIC stream application code used only to mark a normal measurement-window cutoff.
 const MEASUREMENT_COMPLETE_CODE: u32 = 0x4E42;
 
@@ -135,6 +137,7 @@ impl NetBenchClient {
             elapsed: connect_time,
         });
         let (mut send, mut recv) = connection.open_bi().await.map_err(Error::network)?;
+        prioritize_control_stream(&send)?;
         progress(ConnectionStage::ControlStreamOpened);
         write_control(
             &mut send,
@@ -442,6 +445,7 @@ async fn run_benchmark(
     stage.set("protocol negotiation");
     let (mut control_send, mut control_recv) =
         connection.open_bi().await.map_err(Error::network)?;
+    prioritize_control_stream(&control_send)?;
     events.send(NetBenchEvent::ConnectionStage(
         ConnectionStage::ControlStreamOpened,
     ));
@@ -727,6 +731,7 @@ async fn run_probe_benchmark(
 
     let (mut control_send, mut control_recv) =
         connection.open_bi().await.map_err(Error::network)?;
+    prioritize_control_stream(&control_send)?;
     events.send(NetBenchEvent::ConnectionStage(
         ConnectionStage::ControlStreamOpened,
     ));
@@ -1216,6 +1221,12 @@ async fn download_phase(
     tokio::time::sleep_until(deadline).await;
     sample_task.abort_and_wait().await;
     let bytes = total.load(Ordering::Relaxed);
+    tracing::debug!(
+        test_id,
+        direction = "download",
+        cleanup_timeout = ?THROUGHPUT_CLEANUP_TIMEOUT,
+        "waiting for throughput completion on the prioritized control stream"
+    );
     tokio::time::timeout(
         THROUGHPUT_CLEANUP_TIMEOUT,
         expect_finished(control_recv, test_id),
@@ -1257,6 +1268,7 @@ async fn upload_phase(
     let mut upload_streams = Vec::with_capacity(usize::from(streams));
     for _ in 0..streams {
         let mut stream = connection.open_uni().await.map_err(Error::network)?;
+        deprioritize_throughput_stream(&stream)?;
         stream.write_all(&[0x55]).await.map_err(Error::network)?;
         upload_streams.push(stream);
     }
@@ -1288,6 +1300,12 @@ async fn upload_phase(
     }
     let mut progress = VecDeque::<(Duration, u64)>::from([(Duration::ZERO, 0)]);
     let cleanup_deadline = deadline + THROUGHPUT_CLEANUP_TIMEOUT;
+    tracing::debug!(
+        test_id,
+        direction = "upload",
+        cleanup_timeout = ?THROUGHPUT_CLEANUP_TIMEOUT,
+        "waiting for throughput completion on the prioritized control stream"
+    );
     let received_bytes = loop {
         let message = tokio::time::timeout_at(cleanup_deadline, read_control(control_recv))
             .await

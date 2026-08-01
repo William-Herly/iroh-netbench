@@ -9,6 +9,7 @@ mod event;
 mod monitor;
 mod protocol;
 mod report;
+mod scheduling;
 mod statistics;
 pub mod wire;
 
