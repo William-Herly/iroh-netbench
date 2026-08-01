@@ -1,0 +1,39 @@
+# Changelog
+
+All notable changes to this project are documented in this file. The project follows Semantic
+Versioning for the Rust crate; wire-protocol and report-schema versions are tracked independently.
+
+## [Unreleased]
+
+## [0.1.0] - Unreleased
+
+First preview release of the reusable `iroh-netbench` library.
+
+### Added
+
+- Dedicated iroh ALPN with versioned control messages and structured reports.
+- Quick and Standard latency, Datagram timeout, download, upload and loaded-latency measurements.
+- Low-bandwidth Probe-only runs with independent whole-run deadlines.
+- Receiver-controlled `Allow`/`Deny` policy for bandwidth-saturating tests.
+- Passive per-connection and aggregate session monitoring.
+- Explicit benchmark cancellation and awaitable task termination.
+- Direct-path examples and end-to-end iroh integration tests.
+
+### Reliability
+
+- Throughput uses fixed accounting windows followed by reset/stop instead of graceful queued-data
+  draining.
+- Each throughput phase and complete run has a hard deadline.
+- Control streams are scheduled above throughput streams, with bounded cleanup grace for completion
+  messages on Relay and impaired paths.
+- Protocol ALPN, wire version and report schema remain version `1`.
+
+### Release scope
+
+- `iroh-netbench` is the only public crate.
+- `transfer-demo` remains an internal test application and is not a public release artifact.
+- Private Relay-only and Linux netns impaired-path acceptance must pass before the release date is
+  finalized.
+
+[Unreleased]: https://github.com/William-Herly/iroh-netbench/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/William-Herly/iroh-netbench/releases/tag/v0.1.0

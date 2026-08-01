@@ -1,4 +1,4 @@
-//! Throughput configuration contract tests.
+//! Public throughput configuration contract tests.
 
 use iroh_netbench::NetBenchConfig;
 use std::time::Duration;

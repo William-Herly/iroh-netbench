@@ -1,4 +1,4 @@
-//! Cross-module public protocol contract tests.
+//! Cross-module public API and protocol contract tests.
 
 use std::time::Duration;
 

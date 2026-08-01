@@ -5,7 +5,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-publish = false
+readme = "README.md"
+repository = "https://github.com/William-Herly/iroh-netbench"
+documentation = "https://docs.rs/iroh-netbench"
+keywords = ["iroh", "quic", "network", "benchmark", "diagnostics"]
+categories = ["network-programming", "asynchronous"]
+publish = ["crates-io"]
 
 [dependencies]
 bytes.workspace = true
@@ -22,23 +27,3 @@ serde_json.workspace = true
 
 [lints]
 workspace = true
-
-[[example]]
-name = "netbench-server"
-path = "../../examples/netbench-server.rs"
-
-[[example]]
-name = "netbench-client"
-path = "../../examples/netbench-client.rs"
-
-[[test]]
-name = "latency"
-path = "../../tests/latency.rs"
-
-[[test]]
-name = "throughput"
-path = "../../tests/throughput.rs"
-
-[[test]]
-name = "integration"
-path = "../../tests/integration.rs"

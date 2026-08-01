@@ -7,7 +7,17 @@
 
 `iroh-netbench` 复用宿主应用已有的 `Endpoint`。宿主在 Router 中挂载测速协议，只有用户发起测速时才会建立一条独立的 NetBench Connection。
 
-> 当前状态：可用 MVP，线协议 v1。API 仍在调整，暂未发布到 crates.io。
+> 当前状态：`0.1.0` 发布候选，线协议 v1。可复用库在外部 Relay/受损链路验收矩阵通过后，
+> 可以作为第一个预览版本发布；在 crate 达到 `1.0` 前，Rust API 仍可能调整。
+
+## 发布范围
+
+首个公开产物只包含 `iroh-netbench` 库 crate。`transfer-demo` 继续作为内部测试宿主，不发布到
+crates.io；它的桌面打包脚本会有意嵌入私有基础设施配置和私有 CA，不能把这些 demo 压缩包
+作为公开 release 资产分发。
+
+库本身不创建或持有 Relay、Discovery、PKARR 或证书基础设施。宿主应用负责提供已配置的
+`Endpoint`，并决定哪些对端地址和路径允许进行完整吞吐测速。
 
 ## 测试内容
 
@@ -23,14 +33,18 @@
 
 ## 添加依赖
 
-项目发布前可使用本地路径或 Git 依赖：
+`0.1.0` 正式发布前可使用本地路径或 Git 依赖：
 
 ```toml
 [dependencies]
 iroh = "1.0.3"
 iroh-netbench = { path = "../iroh-netbench/crates/iroh-netbench" }
+# 集成阶段也可以跟踪 Git；生产环境应固定到明确的 `rev`。
+# iroh-netbench = { git = "https://github.com/William-Herly/iroh-netbench", branch = "main" }
 serde_json = "1.0"
 ```
+
+发布到 crates.io 后可使用 `iroh-netbench = "0.1.0"`。
 
 Endpoint 的创建、地址发现和 Relay 策略仍由宿主应用负责。
 
@@ -102,6 +116,10 @@ Connection。该连接包含控制 Stream、并行上传/下载 Stream 和 Datag
 `ThroughputReport.measurement_duration` 因而保持为配置窗口，速率只统计窗口内实际收到的
 payload。
 
+两端都会让双向控制 Stream 使用高于吞吐 Stream 的 QUIC 调度优先级，避免 `TestReady`、进度、
+错误和 `TestFinished` 与占满带宽的 payload 处于相同优先级。每个阶段的 cleanup 仍有五秒硬
+上限；这段时间只用于控制消息送达，不会计入测速窗口。
+
 `NetBenchConfig::quick()` 的整轮硬上限为 45 秒，`standard()` 为 75 秒。
 `overall_timeout` 包含建联、路径稳定、各测量阶段和有界收尾；超时会返回带当前阶段名的
 `Error::Timeout { stage }`，并关闭专用测速 Connection。接收端也会把请求时长用于约束实际
@@ -166,6 +184,22 @@ Standard 以及其他完整吞吐测试会在任何测量开始前返回
 | 延迟 | A 发 Probe，B 回显 | A 计算 RTT |
 | 下载 | B → A | A 按收到的 payload 统计 |
 | 上传 | A → B | B 按收到的 payload 统计并确认 |
+
+### Connection 路径选择
+
+NetBench 会使用专用 ALPN 创建一条临时 iroh Connection，它不会继承现有应用
+`PeerSession` 的路径。即使应用已有 Direct Session，只要传入的完整 `EndpointAddr` 包含
+Relay，临时测速 Connection 仍可能选择 Relay。
+
+如果产品只允许 Direct-only 或 Relay-only 测量，应在调用客户端前过滤目标地址，并在完成后
+检查 `report.connection.path`，不能只依据已有 Session 判断本轮测速路径。
+
+对于尚未完成验收或对带宽敏感的路径，建议默认使用低带宽 Probe。完整吞吐测速应由用户明确
+触发，并服从被测端的 `ThroughputPolicy`。
+
+> 发布候选说明：本地 Direct、策略、Probe、deadline 和取消回归已经通过；最新调度修复仍在
+> 复跑私有 Relay-only 与 Linux netns 受损链路矩阵。在该矩阵通过前，产品侧应继续限制
+> Relay/Unknown 的完整吞吐测速。
 
 ## 监控已有连接
 
@@ -272,7 +306,12 @@ cargo run --example netbench-client -- '<服务端输出的 EndpointAddr JSON>'
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
+cargo doc -p iroh-netbench --no-deps
+cargo package -p iroh-netbench --list
 ```
+
+`0.1.0` 的验收和发布步骤见 [RELEASING.md](RELEASING.md)，版本内容见
+[CHANGELOG.md](CHANGELOG.md)。
 
 ## 许可证
 

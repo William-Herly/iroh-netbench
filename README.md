@@ -8,8 +8,20 @@ A small embeddable Rust component for benchmarking and monitoring
 `iroh-netbench` reuses an application's existing `Endpoint`. It mounts a benchmark protocol on
 the application's Router and opens a dedicated connection only when a test is requested.
 
-> Status: working MVP, wire protocol v1. The API is still evolving and the crate is not published
-> to crates.io yet.
+> Status: `0.1.0` release candidate, wire protocol v1. The reusable library is ready for a first
+> preview release after the external Relay/impaired-path acceptance matrix passes. Rust APIs may
+> still evolve while the crate remains below `1.0`.
+
+## Release scope
+
+The first public artifact is the `iroh-netbench` library crate. `transfer-demo` remains an internal
+test host: it is not published to crates.io, and its desktop packaging scripts intentionally embed
+private infrastructure configuration and a private CA. Do not distribute those demo archives as
+public release assets.
+
+The library does not create or own Relay, discovery, PKARR or certificate infrastructure. The host
+application supplies a configured `Endpoint` and decides which peer addresses and paths are
+eligible for a full throughput test.
 
 ## Measurements
 
@@ -25,14 +37,18 @@ the application's Router and opens a dedicated connection only when a test is re
 
 ## Add the crate
 
-Until the crate is published, use a path or Git dependency:
+Until `0.1.0` is published, use a path or Git dependency:
 
 ```toml
 [dependencies]
 iroh = "1.0.3"
 iroh-netbench = { path = "../iroh-netbench/crates/iroh-netbench" }
+# Or track Git during integration; pin an exact `rev` in production.
+# iroh-netbench = { git = "https://github.com/William-Herly/iroh-netbench", branch = "main" }
 serde_json = "1.0"
 ```
+
+After the crates.io release, use `iroh-netbench = "0.1.0"`.
 
 The host application remains responsible for creating the `Endpoint` and configuring its address
 discovery and Relay policy.
@@ -106,6 +122,11 @@ streams and the receiver stops unread data; queued QUIC data is not gracefully d
 reported duration. `ThroughputReport.measurement_duration` therefore remains the configured
 window, while only payload received inside that window contributes to the rate.
 
+Both peers give the bidirectional control stream a higher QUIC scheduling priority than throughput
+streams, so `TestReady`, progress, errors and `TestFinished` do not compete at equal priority with
+bandwidth-saturating payload. Per-phase cleanup has a five-second hard bound; this is grace for
+control delivery, not extra measurement time.
+
 `NetBenchConfig::quick()` has a 45-second overall hard limit and `standard()` has a 75-second
 limit. `overall_timeout` includes connection setup, path stabilization, measurements and bounded
 cleanup. A timeout returns `Error::Timeout { stage }` and closes the dedicated benchmark
@@ -174,6 +195,23 @@ For a run initiated by A against B, the control roles remain fixed:
 | Latency | A sends probes, B echoes | A calculates RTT |
 | Download | B → A | A counts received payload |
 | Upload | A → B | B counts and confirms received payload |
+
+### Connection path selection
+
+NetBench creates a dedicated temporary iroh Connection with its own ALPN. Its selected path is not
+inherited from an existing application `PeerSession`: supplying a complete `EndpointAddr` can let
+the temporary connection select Relay even when another connection to the same peer is Direct.
+
+If a product requires Direct-only or Relay-only measurement, filter the target address before
+calling the client and verify `report.connection.path` afterwards. Do not infer the benchmark path
+only from an existing session.
+
+Low-bandwidth probes are the recommended default diagnostic on unqualified or bandwidth-sensitive
+paths. Full throughput should be opt-in and subject to the receiver's policy.
+
+> Release-candidate note: local Direct, policy, probe, deadline and cancellation regressions pass.
+> Private Relay-only and Linux netns impaired-path acceptance is still being rerun for the latest
+> scheduling fix. Products should keep Relay/Unknown full throughput gated until that matrix passes.
 
 ## Monitor existing connections
 
@@ -283,7 +321,12 @@ Local Rust API, UI and passive-monitoring changes do not bump it.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --all-targets
+cargo doc -p iroh-netbench --no-deps
+cargo package -p iroh-netbench --list
 ```
+
+See [RELEASING.md](RELEASING.md) for the `0.1.0` acceptance and publication checklist, and
+[CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## License
 

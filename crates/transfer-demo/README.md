@@ -3,6 +3,11 @@
 Internal desktop test application for exercising `iroh-netbench` with a minimal single-file
 transfer protocol. It is not part of the reusable NetBench component API.
 
+> **Internal distribution only.** `transfer-demo` has `publish = false`. The macOS and Windows
+> packaging scripts copy `private-pki/private-infra.json` and the private CA certificate into the
+> resulting archive. Never attach those archives to a public GitHub release or upload them to a
+> public package registry. Relay tokens and private keys must never be packaged.
+
 ## Run
 
 ```bash

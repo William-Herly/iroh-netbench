@@ -1,4 +1,4 @@
-//! Latency configuration contract tests.
+//! Public latency configuration contract tests.
 
 use std::time::Duration;
 

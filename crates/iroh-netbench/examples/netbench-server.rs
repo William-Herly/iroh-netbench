@@ -1,4 +1,4 @@
-//! Minimal directly reachable `NetBench` server.
+//! Minimal direct-only `NetBench` server.
 
 use std::{error::Error, time::Duration};
 

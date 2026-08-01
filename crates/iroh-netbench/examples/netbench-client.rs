@@ -1,4 +1,4 @@
-//! Minimal `NetBench` client accepting `EndpointAddr` JSON from the server example.
+//! Minimal direct-only `NetBench` client accepting `EndpointAddr` JSON from the server example.
 
 use std::{env, error::Error};
 
