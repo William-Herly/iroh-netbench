@@ -7,8 +7,8 @@
 
 `iroh-netbench` 复用宿主应用已有的 `Endpoint`。宿主在 Router 中挂载测速协议，只有用户发起测速时才会建立一条独立的 NetBench Connection。
 
-> 当前状态：`0.1.0` 发布候选，线协议 v1。可复用库在外部 Relay/受损链路验收矩阵通过后，
-> 可以作为第一个预览版本发布；在 crate 达到 `1.0` 前，Rust API 仍可能调整。
+> 当前状态：`0.1.0` 发布候选，线协议 v1。可复用库已经通过 Direct、Relay 和受损链路验收
+> 矩阵，可以发布第一个预览版本；在 crate 达到 `1.0` 前，Rust API 仍可能调整。
 
 ## 发布范围
 
@@ -194,12 +194,13 @@ Relay，临时测速 Connection 仍可能选择 Relay。
 如果产品只允许 Direct-only 或 Relay-only 测量，应在调用客户端前过滤目标地址，并在完成后
 检查 `report.connection.path`，不能只依据已有 Session 判断本轮测速路径。
 
-对于尚未完成验收或对带宽敏感的路径，建议默认使用低带宽 Probe。完整吞吐测速应由用户明确
+对于尚未确认或对带宽敏感的路径，建议默认使用低带宽 Probe。完整吞吐测速应由用户明确
 触发，并服从被测端的 `ThroughputPolicy`。
 
-> 发布候选说明：本地 Direct、策略、Probe、deadline 和取消回归已经通过；最新调度修复仍在
-> 复跑私有 Relay-only 与 Linux netns 受损链路矩阵。在该矩阵通过前，产品侧应继续限制
-> Relay/Unknown 的完整吞吐测速。
+`0.1.0` 验收矩阵已经通过私有 Relay-only Quick、Direct/Relay Quick、对端拒绝、拒绝时的
+Probe-only、实时事件和主动取消。Linux netns 在 `12 Mbit/s + 50±10 ms` 下通过 `0%`、
+`0.5%` 和 `2%` 丢包测试；下载与上传的五秒计量窗口保持在 ±250 ms 内，Quick 整轮小于
+45 秒，结束或取消后不再继续占用大量带宽，业务 PeerSession 保持可用。
 
 ## 监控已有连接
 
@@ -310,8 +311,7 @@ cargo doc -p iroh-netbench --no-deps
 cargo package -p iroh-netbench --list
 ```
 
-`0.1.0` 的验收和发布步骤见 [RELEASING.md](RELEASING.md)，版本内容见
-[CHANGELOG.md](CHANGELOG.md)。
+版本内容见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 许可证
 

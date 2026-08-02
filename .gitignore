@@ -5,6 +5,10 @@
 # Local note-tool state and write logs
 /.siyuan-mcp/
 
+# Local maintainer notes and personal release checklist
+/RELEASING.md
+/notes/
+
 # Private deployment research and server operations
 /deploy/
 

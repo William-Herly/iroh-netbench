@@ -8,9 +8,9 @@ A small embeddable Rust component for benchmarking and monitoring
 `iroh-netbench` reuses an application's existing `Endpoint`. It mounts a benchmark protocol on
 the application's Router and opens a dedicated connection only when a test is requested.
 
-> Status: `0.1.0` release candidate, wire protocol v1. The reusable library is ready for a first
-> preview release after the external Relay/impaired-path acceptance matrix passes. Rust APIs may
-> still evolve while the crate remains below `1.0`.
+> Status: `0.1.0` release candidate, wire protocol v1. The reusable library has passed its Direct,
+> Relay and impaired-path acceptance matrix and is ready for its first preview release. Rust APIs
+> may still evolve while the crate remains below `1.0`.
 
 ## Release scope
 
@@ -209,9 +209,11 @@ only from an existing session.
 Low-bandwidth probes are the recommended default diagnostic on unqualified or bandwidth-sensitive
 paths. Full throughput should be opt-in and subject to the receiver's policy.
 
-> Release-candidate note: local Direct, policy, probe, deadline and cancellation regressions pass.
-> Private Relay-only and Linux netns impaired-path acceptance is still being rerun for the latest
-> scheduling fix. Products should keep Relay/Unknown full throughput gated until that matrix passes.
+The `0.1.0` acceptance matrix passed private Relay-only Quick runs, Direct and Relay Quick,
+receiver denial, Probe-only under denial, live events and active cancellation. Linux netns runs at
+`12 Mbit/s + 50±10 ms` passed with `0%`, `0.5%` and `2%` packet loss. Five-second download and
+upload windows stayed within ±250 ms, complete Quick runs stayed below 45 seconds, cleanup stopped
+high-bandwidth traffic, and the application PeerSession remained usable.
 
 ## Monitor existing connections
 
@@ -325,8 +327,7 @@ cargo doc -p iroh-netbench --no-deps
 cargo package -p iroh-netbench --list
 ```
 
-See [RELEASING.md](RELEASING.md) for the `0.1.0` acceptance and publication checklist, and
-[CHANGELOG.md](CHANGELOG.md) for release notes.
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## License
 

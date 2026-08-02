@@ -71,6 +71,5 @@ final `ConnectionReport.path`.
 
 - [Full English guide](https://github.com/William-Herly/iroh-netbench/blob/main/README.md)
 - [中文指南](https://github.com/William-Herly/iroh-netbench/blob/main/README.zh-CN.md)
-- [Release process](https://github.com/William-Herly/iroh-netbench/blob/main/RELEASING.md)
 
 Licensed under either MIT or Apache-2.0, at your option.

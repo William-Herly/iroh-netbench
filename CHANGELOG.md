@@ -5,7 +5,7 @@ Versioning for the Rust crate; wire-protocol and report-schema versions are trac
 
 ## [Unreleased]
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-08-02
 
 First preview release of the reusable `iroh-netbench` library.
 
@@ -32,8 +32,8 @@ First preview release of the reusable `iroh-netbench` library.
 
 - `iroh-netbench` is the only public crate.
 - `transfer-demo` remains an internal test application and is not a public release artifact.
-- Private Relay-only and Linux netns impaired-path acceptance must pass before the release date is
-  finalized.
+- Private Relay-only and Linux netns impaired-path acceptance passed, including `0%`, `0.5%` and
+  `2%` packet-loss runs at `12 Mbit/s + 50±10 ms`.
 
 [Unreleased]: https://github.com/William-Herly/iroh-netbench/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/William-Herly/iroh-netbench/releases/tag/v0.1.0
