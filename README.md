@@ -2,15 +2,18 @@
 
 English | [中文](README.zh-CN.md)
 
+[![crates.io](https://img.shields.io/crates/v/iroh-netbench.svg)](https://crates.io/crates/iroh-netbench)
+[![docs.rs](https://img.shields.io/docsrs/iroh-netbench)](https://docs.rs/iroh-netbench)
+
 A small embeddable Rust component for benchmarking and monitoring
 [iroh](https://github.com/n0-computer/iroh) QUIC connections.
 
 `iroh-netbench` reuses an application's existing `Endpoint`. It mounts a benchmark protocol on
 the application's Router and opens a dedicated connection only when a test is requested.
 
-> Status: `0.1.0` release candidate, wire protocol v1. The reusable library has passed its Direct,
-> Relay and impaired-path acceptance matrix and is ready for its first preview release. Rust APIs
-> may still evolve while the crate remains below `1.0`.
+> Status: `0.1.0` is published on crates.io, with wire protocol v1. The reusable library passed its
+> Direct, Relay and impaired-path acceptance matrix. Rust APIs may still evolve while the crate
+> remains below `1.0`.
 
 ## Release scope
 
@@ -37,18 +40,15 @@ eligible for a full throughput test.
 
 ## Add the crate
 
-Until `0.1.0` is published, use a path or Git dependency:
+Add the published crate from [crates.io](https://crates.io/crates/iroh-netbench). API documentation
+is available on [docs.rs](https://docs.rs/iroh-netbench):
 
 ```toml
 [dependencies]
 iroh = "1.0.3"
-iroh-netbench = { path = "../iroh-netbench/crates/iroh-netbench" }
-# Or track Git during integration; pin an exact `rev` in production.
-# iroh-netbench = { git = "https://github.com/William-Herly/iroh-netbench", branch = "main" }
+iroh-netbench = "0.1.0"
 serde_json = "1.0"
 ```
-
-After the crates.io release, use `iroh-netbench = "0.1.0"`.
 
 The host application remains responsible for creating the `Endpoint` and configuring its address
 discovery and Relay policy.

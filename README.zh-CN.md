@@ -2,13 +2,16 @@
 
 [English](README.md) | 中文
 
+[![crates.io](https://img.shields.io/crates/v/iroh-netbench.svg)](https://crates.io/crates/iroh-netbench)
+[![docs.rs](https://img.shields.io/docsrs/iroh-netbench)](https://docs.rs/iroh-netbench)
+
 一个用于测试和监控 [iroh](https://github.com/n0-computer/iroh) QUIC 连接的轻量 Rust
 组件。
 
 `iroh-netbench` 复用宿主应用已有的 `Endpoint`。宿主在 Router 中挂载测速协议，只有用户发起测速时才会建立一条独立的 NetBench Connection。
 
-> 当前状态：`0.1.0` 发布候选，线协议 v1。可复用库已经通过 Direct、Relay 和受损链路验收
-> 矩阵，可以发布第一个预览版本；在 crate 达到 `1.0` 前，Rust API 仍可能调整。
+> 当前状态：`0.1.0` 已发布到 crates.io，线协议 v1。可复用库已经通过 Direct、Relay 和受损
+> 链路验收矩阵；在 crate 达到 `1.0` 前，Rust API 仍可能调整。
 
 ## 发布范围
 
@@ -33,18 +36,15 @@ crates.io；它的桌面打包脚本会有意嵌入私有基础设施配置和�
 
 ## 添加依赖
 
-`0.1.0` 正式发布前可使用本地路径或 Git 依赖：
+从 [crates.io](https://crates.io/crates/iroh-netbench) 添加正式发布的 crate；API 文档见
+[docs.rs](https://docs.rs/iroh-netbench)：
 
 ```toml
 [dependencies]
 iroh = "1.0.3"
-iroh-netbench = { path = "../iroh-netbench/crates/iroh-netbench" }
-# 集成阶段也可以跟踪 Git；生产环境应固定到明确的 `rev`。
-# iroh-netbench = { git = "https://github.com/William-Herly/iroh-netbench", branch = "main" }
+iroh-netbench = "0.1.0"
 serde_json = "1.0"
 ```
-
-发布到 crates.io 后可使用 `iroh-netbench = "0.1.0"`。
 
 Endpoint 的创建、地址发现和 Relay 策略仍由宿主应用负责。
 
