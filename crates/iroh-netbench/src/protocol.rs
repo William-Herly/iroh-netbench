@@ -10,6 +10,7 @@ use std::{
 
 use bytes::Bytes;
 use iroh::{
+    EndpointId,
     endpoint::{Connection, ReadError, RecvStream, SendStream, VarInt, WriteError},
     protocol::{AcceptError, ProtocolHandler},
 };
@@ -64,6 +65,7 @@ pub struct NetBenchProtocol {
     max_chunk_size: u32,
     throughput_allowed: Arc<AtomicBool>,
     permits: Arc<Semaphore>,
+    allowed_peer: Option<EndpointId>,
     connection_observer: Option<ConnectionObserver>,
 }
 
@@ -76,6 +78,7 @@ impl std::fmt::Debug for NetBenchProtocol {
             .field("max_parallel_streams", &self.max_parallel_streams)
             .field("throughput_policy", &self.throughput_policy())
             .field("max_chunk_size", &self.max_chunk_size)
+            .field("allowed_peer", &self.allowed_peer)
             .field(
                 "has_connection_observer",
                 &self.connection_observer.is_some(),
@@ -393,6 +396,16 @@ impl NetBenchProtocol {
 
 impl ProtocolHandler for NetBenchProtocol {
     async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        if self
+            .allowed_peer
+            .is_some_and(|allowed| connection.remote_id() != allowed)
+        {
+            connection.close(0_u8.into(), b"netbench peer is not authorized");
+            return Err(AcceptError::from_err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "netbench peer is not authorized",
+            )));
+        }
         if let Some(observer) = &self.connection_observer {
             observer(connection.clone());
         }
@@ -423,6 +436,7 @@ pub struct NetBenchProtocolBuilder {
     max_parallel_streams: u16,
     max_chunk_size: u32,
     throughput_policy: ThroughputPolicy,
+    allowed_peer: Option<EndpointId>,
     connection_observer: Option<ConnectionObserver>,
 }
 
@@ -435,6 +449,7 @@ impl std::fmt::Debug for NetBenchProtocolBuilder {
             .field("max_parallel_streams", &self.max_parallel_streams)
             .field("throughput_policy", &self.throughput_policy)
             .field("max_chunk_size", &self.max_chunk_size)
+            .field("allowed_peer", &self.allowed_peer)
             .field(
                 "has_connection_observer",
                 &self.connection_observer.is_some(),
@@ -472,6 +487,13 @@ impl NetBenchProtocolBuilder {
         self
     }
 
+    /// Restricts benchmark connections to one TLS-authenticated iroh endpoint identity.
+    #[must_use]
+    pub const fn allowed_peer(mut self, endpoint_id: EndpointId) -> Self {
+        self.allowed_peer = Some(endpoint_id);
+        self
+    }
+
     /// Observes each accepted benchmark connection.
     #[must_use]
     pub fn on_connection(mut self, observer: impl Fn(Connection) + Send + Sync + 'static) -> Self {
@@ -500,6 +522,7 @@ impl NetBenchProtocolBuilder {
                 ThroughputPolicy::Allow
             ))),
             permits: Arc::new(Semaphore::new(self.max_concurrent_tests)),
+            allowed_peer: self.allowed_peer,
             connection_observer: self.connection_observer,
         }
     }
@@ -513,6 +536,7 @@ impl Default for NetBenchProtocolBuilder {
             max_parallel_streams: 8,
             max_chunk_size: DEFAULT_MAX_CHUNK_SIZE,
             throughput_policy: ThroughputPolicy::Allow,
+            allowed_peer: None,
             connection_observer: None,
         }
     }

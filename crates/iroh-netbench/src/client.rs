@@ -12,7 +12,10 @@ use std::{
 use bytes::Bytes;
 use iroh::{
     Endpoint, EndpointAddr, TransportAddr,
-    endpoint::{Connection, PathStats, ReadError, RecvStream, SendStream, VarInt, WriteError},
+    endpoint::{
+        ConnectOptions, Connection, DialPolicy, PathStats, ReadError, RecvStream, SendStream,
+        VarInt, WriteError,
+    },
 };
 use tokio::{
     sync::mpsc,
@@ -43,6 +46,7 @@ const MEASUREMENT_COMPLETE_CODE: u32 = 0x4E42;
 #[derive(Clone)]
 pub struct NetBenchClient {
     endpoint: Endpoint,
+    connect_options: ConnectOptions,
     connection_observer: Option<ConnectionObserver>,
 }
 
@@ -51,6 +55,7 @@ impl std::fmt::Debug for NetBenchClient {
         formatter
             .debug_struct("NetBenchClient")
             .field("endpoint", &self.endpoint)
+            .field("connect_options", &self.connect_options)
             .field(
                 "has_connection_observer",
                 &self.connection_observer.is_some(),
@@ -65,8 +70,22 @@ impl NetBenchClient {
     pub fn new(endpoint: Endpoint) -> Self {
         Self {
             endpoint,
+            connect_options: ConnectOptions::new(),
             connection_observer: None,
         }
+    }
+
+    /// Applies local iroh connection options to every benchmark connection.
+    #[must_use]
+    pub fn with_connect_options(mut self, connect_options: ConnectOptions) -> Self {
+        self.connect_options = connect_options;
+        self
+    }
+
+    /// Applies a local iroh dial policy to every benchmark connection.
+    #[must_use]
+    pub fn with_dial_policy(self, dial_policy: DialPolicy) -> Self {
+        self.with_connect_options(ConnectOptions::new().with_dial_policy(dial_policy))
     }
 
     /// Observes each benchmark connection after its QUIC handshake succeeds.
@@ -126,7 +145,9 @@ impl NetBenchClient {
         progress(ConnectionStage::QuicHandshakeStarted);
         let connection = self
             .endpoint
-            .connect(peer, NETBENCH_ALPN)
+            .connect_with_opts(peer, NETBENCH_ALPN, self.connect_options.clone())
+            .await
+            .map_err(Error::network)?
             .await
             .map_err(Error::network)?;
         if let Some(observer) = &self.connection_observer {
@@ -205,6 +226,7 @@ impl NetBenchClient {
                 self.endpoint.clone(),
                 peer,
                 config,
+                self.connect_options.clone(),
                 &EventSink(event_tx),
                 self.connection_observer.as_ref(),
             ),
@@ -228,6 +250,7 @@ impl NetBenchClient {
         let (event_tx, event_rx) = mpsc::channel(128);
         let endpoint = self.endpoint.clone();
         let connection_observer = self.connection_observer.clone();
+        let connect_options = self.connect_options.clone();
         let events = EventSink(event_tx);
         let overall_timeout = config.overall_timeout;
         let active_connection = ActiveConnection::default();
@@ -235,17 +258,15 @@ impl NetBenchClient {
         let stage = BenchmarkStage::default();
         let task_stage = stage.clone();
         let task = tokio::spawn(async move {
+            let dial = BenchmarkDial {
+                endpoint,
+                peer,
+                connect_options,
+                connection_observer,
+            };
             let result = if let Ok(result) = tokio::time::timeout(
                 overall_timeout,
-                run_benchmark(
-                    endpoint,
-                    peer,
-                    config,
-                    &events,
-                    connection_observer.as_ref(),
-                    &task_connection,
-                    &task_stage,
-                ),
+                run_benchmark(dial, config, &events, &task_connection, &task_stage),
             )
             .await
             {
@@ -404,16 +425,21 @@ impl EventSink {
     }
 }
 
+struct BenchmarkDial {
+    endpoint: Endpoint,
+    peer: EndpointAddr,
+    connect_options: ConnectOptions,
+    connection_observer: Option<ConnectionObserver>,
+}
+
 #[allow(
     clippy::too_many_lines,
     reason = "linear ordering documents the benchmark state machine"
 )]
 async fn run_benchmark(
-    endpoint: Endpoint,
-    peer: EndpointAddr,
+    dial: BenchmarkDial,
     config: NetBenchConfig,
     events: &EventSink,
-    connection_observer: Option<&ConnectionObserver>,
     active_connection: &ActiveConnection,
     stage: &BenchmarkStage,
 ) -> Result<NetBenchReport> {
@@ -426,12 +452,15 @@ async fn run_benchmark(
     events.send(NetBenchEvent::ConnectionStage(
         ConnectionStage::QuicHandshakeStarted,
     ));
-    let connection = endpoint
-        .connect(peer, NETBENCH_ALPN)
+    let connection = dial
+        .endpoint
+        .connect_with_opts(dial.peer, NETBENCH_ALPN, dial.connect_options)
+        .await
+        .map_err(Error::network)?
         .await
         .map_err(Error::network)?;
     let _connection_guard = active_connection.register(&connection);
-    if let Some(observer) = connection_observer {
+    if let Some(observer) = dial.connection_observer.as_ref() {
         observer(connection.clone());
     }
     let connect_time = connect_started.elapsed();
@@ -700,6 +729,7 @@ async fn run_probe_benchmark(
     endpoint: Endpoint,
     peer: EndpointAddr,
     config: NetBenchProbeConfig,
+    connect_options: ConnectOptions,
     events: &EventSink,
     connection_observer: Option<&ConnectionObserver>,
 ) -> Result<NetBenchProbeReport> {
@@ -713,7 +743,9 @@ async fn run_probe_benchmark(
         ConnectionStage::QuicHandshakeStarted,
     ));
     let connection = endpoint
-        .connect(peer, NETBENCH_ALPN)
+        .connect_with_opts(peer, NETBENCH_ALPN, connect_options)
+        .await
+        .map_err(Error::network)?
         .await
         .map_err(Error::network)?;
     let probe_connection = ActiveConnection::default();

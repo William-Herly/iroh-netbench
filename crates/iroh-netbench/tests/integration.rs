@@ -2,10 +2,15 @@
 
 use std::time::Duration;
 
-use iroh::{Endpoint, RelayMode, endpoint::presets, protocol::Router};
+use iroh::{
+    Endpoint, EndpointAddr, RelayMode, TransportAddr,
+    endpoint::{DialPathFilter, DialPolicy, presets},
+    protocol::Router,
+};
 use iroh_netbench::{
     Error, NETBENCH_ALPN, NetBenchClient, NetBenchConfig, NetBenchEvent, NetBenchProbeConfig,
-    NetBenchProtocol, PROTOCOL_VERSION, SessionMonitor, SessionMonitorConfig, ThroughputPolicy,
+    NetBenchProtocol, PROTOCOL_VERSION, PathKind, SessionMonitor, SessionMonitorConfig,
+    ThroughputPolicy,
 };
 
 #[test]
@@ -28,6 +33,67 @@ fn throughput_policy_is_shared_by_protocol_clones() {
     assert_eq!(protocol.throughput_policy(), ThroughputPolicy::Deny);
     control.set_throughput_policy(ThroughputPolicy::Allow);
     assert_eq!(protocol.throughput_policy(), ThroughputPolicy::Allow);
+}
+
+#[tokio::test]
+async fn client_dial_policy_and_server_peer_authorization_are_enforced() {
+    let authorized = Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .relay_mode(RelayMode::Disabled)
+        .bind()
+        .await
+        .unwrap();
+    let unauthorized = Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .relay_mode(RelayMode::Disabled)
+        .bind()
+        .await
+        .unwrap();
+    let server = Endpoint::builder(presets::Minimal)
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0")
+        .unwrap()
+        .relay_mode(RelayMode::Disabled)
+        .bind()
+        .await
+        .unwrap();
+    let router = Router::builder(server.clone())
+        .accept(
+            NETBENCH_ALPN,
+            NetBenchProtocol::builder()
+                .allowed_peer(authorized.id())
+                .build(),
+        )
+        .spawn();
+    let server_v4 = server
+        .addr()
+        .ip_addrs()
+        .copied()
+        .find(std::net::SocketAddr::is_ipv4)
+        .unwrap();
+    let target = EndpointAddr::from_parts(server.id(), [TransportAddr::Ip(server_v4)]);
+    let policy = DialPolicy::supplied_only(DialPathFilter::DIRECT_IPV4);
+
+    let info = NetBenchClient::new(authorized.clone())
+        .with_dial_policy(policy)
+        .check_with_progress_timeout(target.clone(), Duration::ZERO, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(info.path, PathKind::DirectIpv4);
+
+    let denied = NetBenchClient::new(unauthorized.clone())
+        .with_dial_policy(policy)
+        .check_with_progress_timeout(target, Duration::ZERO, |_| {})
+        .await;
+    assert!(denied.is_err());
+
+    router.shutdown().await.unwrap();
+    authorized.close().await;
+    unauthorized.close().await;
 }
 
 #[tokio::test]
