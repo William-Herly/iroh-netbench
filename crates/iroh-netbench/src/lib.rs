@@ -13,11 +13,11 @@ mod scheduling;
 mod statistics;
 pub mod wire;
 
-pub use client::{NetBenchClient, NetBenchTest};
+pub use client::{NetBenchInitiator, NetBenchTest};
 pub use config::{NetBenchConfig, NetBenchProbeConfig};
 pub use error::{Error, Result};
 pub use event::{
-    ConnectionInfo, ConnectionStage, LatencySample, LossSample, NetBenchEvent, ThroughputDirection,
+    FlowInfo, FlowStage, LatencySample, LossSample, NetBenchEvent, ThroughputDirection,
     ThroughputSample,
 };
 pub use monitor::{
@@ -26,7 +26,7 @@ pub use monitor::{
 };
 pub use protocol::{NetBenchProtocol, NetBenchProtocolBuilder, ThroughputPolicy};
 pub use report::{
-    ConnectionReport, LatencyReport, LoadedLatencyReport, LossReport, NetBenchProbeReport,
+    LatencyReport, LoadedLatencyReport, LossReport, MeasurementPathReport, NetBenchProbeReport,
     NetBenchReport, PathKind, ThroughputReport, TransportReport,
 };
 
@@ -39,4 +39,7 @@ pub const NETBENCH_ALPN: &[u8] = b"/iroh/netbench/1";
 pub const PROTOCOL_VERSION: u16 = 1;
 
 /// Current JSON/report schema version.
-pub const SCHEMA_VERSION: u16 = 1;
+///
+/// Version 2 removes connection-establishment fields: netbench now reports only the business-flow
+/// measurement window of a caller-owned connection.
+pub const SCHEMA_VERSION: u16 = 2;

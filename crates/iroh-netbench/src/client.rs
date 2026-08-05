@@ -11,11 +11,8 @@ use std::{
 
 use bytes::Bytes;
 use iroh::{
-    Endpoint, EndpointAddr, TransportAddr,
-    endpoint::{
-        ConnectOptions, Connection, DialPolicy, PathStats, ReadError, RecvStream, SendStream,
-        VarInt, WriteError,
-    },
+    TransportAddr,
+    endpoint::{Connection, PathStats, ReadError, RecvStream, SendStream, VarInt, WriteError},
 };
 use tokio::{
     sync::mpsc,
@@ -24,10 +21,10 @@ use tokio::{
 };
 
 use crate::{
-    ConnectionInfo, ConnectionReport, ConnectionStage, Error, LatencySample, LoadedLatencyReport,
-    LossReport, LossSample, NETBENCH_ALPN, NetBenchConfig, NetBenchEvent, NetBenchProbeConfig,
-    NetBenchProbeReport, NetBenchReport, PROTOCOL_VERSION, PathKind, Result, SCHEMA_VERSION,
-    SessionMonitor, ThroughputDirection, ThroughputReport, ThroughputSample, TransportReport,
+    Error, FlowInfo, FlowStage, LatencySample, LoadedLatencyReport, LossReport, LossSample,
+    MeasurementPathReport, NetBenchConfig, NetBenchEvent, NetBenchProbeConfig, NetBenchProbeReport,
+    NetBenchReport, PROTOCOL_VERSION, PathKind, Result, SCHEMA_VERSION, SessionMonitor,
+    ThroughputDirection, ThroughputReport, ThroughputSample, TransportReport,
     scheduling::{
         THROUGHPUT_CLEANUP_TIMEOUT, deprioritize_throughput_stream, prioritize_control_stream,
     },
@@ -42,20 +39,16 @@ type ConnectionObserver = Arc<dyn Fn(Connection) + Send + Sync>;
 // QUIC stream application code used only to mark a normal measurement-window cutoff.
 const MEASUREMENT_COMPLETE_CODE: u32 = 0x4E42;
 
-/// Starts benchmark connections from an existing long-lived endpoint.
+/// Starts benchmark business flows on a caller-owned iroh connection.
 #[derive(Clone)]
-pub struct NetBenchClient {
-    endpoint: Endpoint,
-    connect_options: ConnectOptions,
+pub struct NetBenchInitiator {
     connection_observer: Option<ConnectionObserver>,
 }
 
-impl std::fmt::Debug for NetBenchClient {
+impl std::fmt::Debug for NetBenchInitiator {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("NetBenchClient")
-            .field("endpoint", &self.endpoint)
-            .field("connect_options", &self.connect_options)
+            .debug_struct("NetBenchInitiator")
             .field(
                 "has_connection_observer",
                 &self.connection_observer.is_some(),
@@ -64,38 +57,29 @@ impl std::fmt::Debug for NetBenchClient {
     }
 }
 
-impl NetBenchClient {
-    /// Creates a client without taking ownership of the application's endpoint lifecycle.
+impl Default for NetBenchInitiator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl NetBenchInitiator {
+    /// Creates an initiator which never dials or owns an endpoint/connection lifecycle.
     #[must_use]
-    pub fn new(endpoint: Endpoint) -> Self {
+    pub fn new() -> Self {
         Self {
-            endpoint,
-            connect_options: ConnectOptions::new(),
             connection_observer: None,
         }
     }
 
-    /// Applies local iroh connection options to every benchmark connection.
-    #[must_use]
-    pub fn with_connect_options(mut self, connect_options: ConnectOptions) -> Self {
-        self.connect_options = connect_options;
-        self
-    }
-
-    /// Applies a local iroh dial policy to every benchmark connection.
-    #[must_use]
-    pub fn with_dial_policy(self, dial_policy: DialPolicy) -> Self {
-        self.with_connect_options(ConnectOptions::new().with_dial_policy(dial_policy))
-    }
-
-    /// Observes each benchmark connection after its QUIC handshake succeeds.
+    /// Observes the caller-owned connection when a benchmark flow starts.
     #[must_use]
     pub fn on_connection(mut self, observer: impl Fn(Connection) + Send + Sync + 'static) -> Self {
         self.connection_observer = Some(Arc::new(observer));
         self
     }
 
-    /// Registers every created benchmark connection with a reusable session monitor.
+    /// Registers each supplied benchmark connection with a reusable session monitor.
     #[must_use]
     pub fn with_monitor(self, monitor: SessionMonitor) -> Self {
         self.on_connection(move |connection| {
@@ -103,106 +87,17 @@ impl NetBenchClient {
         })
     }
 
-    /// Verifies that the peer accepts the `NetBench` ALPN and wire version.
-    ///
-    /// # Errors
-    ///
-    /// Returns a connection, negotiation, or peer error.
-    pub async fn check(&self, peer: EndpointAddr) -> Result<ConnectionInfo> {
-        self.check_with_progress(peer, |_| {}).await
-    }
-
-    /// Performs [`Self::check`] while reporting every connection milestone.
-    ///
-    /// # Errors
-    ///
-    /// Returns a connection, negotiation, or peer error.
-    pub async fn check_with_progress(
-        &self,
-        peer: EndpointAddr,
-        progress: impl FnMut(ConnectionStage),
-    ) -> Result<ConnectionInfo> {
-        self.check_with_progress_timeout(peer, Duration::from_secs(3), progress)
-            .await
-    }
-
-    /// Performs [`Self::check`] with a caller-selected path stabilization timeout.
-    ///
-    /// A zero timeout is useful when the hosting endpoint deliberately disables direct
-    /// transports and therefore must remain on its configured relay.
-    ///
-    /// # Errors
-    ///
-    /// Returns a connection, negotiation, or peer error.
-    pub async fn check_with_progress_timeout(
-        &self,
-        peer: EndpointAddr,
-        path_stabilization_timeout: Duration,
-        mut progress: impl FnMut(ConnectionStage),
-    ) -> Result<ConnectionInfo> {
-        progress(ConnectionStage::PreparingAddress);
-        let started = Instant::now();
-        progress(ConnectionStage::QuicHandshakeStarted);
-        let connection = self
-            .endpoint
-            .connect_with_opts(peer, NETBENCH_ALPN, self.connect_options.clone())
-            .await
-            .map_err(Error::network)?
-            .await
-            .map_err(Error::network)?;
-        if let Some(observer) = &self.connection_observer {
-            observer(connection.clone());
-        }
-        let connect_time = started.elapsed();
-        progress(ConnectionStage::QuicHandshakeCompleted {
-            elapsed: connect_time,
-        });
-        let (mut send, mut recv) = connection.open_bi().await.map_err(Error::network)?;
-        prioritize_control_stream(&send)?;
-        progress(ConnectionStage::ControlStreamOpened);
-        write_control(
-            &mut send,
-            &ControlMessage::ClientHello {
-                protocol_versions: vec![PROTOCOL_VERSION],
-                capabilities: Capabilities {
-                    datagram_probes: true,
-                    loaded_latency: true,
-                    path_stats: true,
-                },
-            },
-        )
-        .await?;
-        progress(ConnectionStage::ClientHelloSent);
-        match read_control(&mut recv).await? {
-            ControlMessage::ServerHello {
-                selected_version, ..
-            } if selected_version == PROTOCOL_VERSION => {
-                progress(ConnectionStage::ServerHelloReceived {
-                    version: selected_version,
-                });
-            }
-            message => return Err(peer_or_protocol_error(message)),
-        }
-        let path = observe_path_for_check(
-            &connection,
-            started,
-            path_stabilization_timeout,
-            &mut progress,
-        )
-        .await;
-        send.finish().map_err(Error::network)?;
-        let info = ConnectionInfo { connect_time, path };
-        connection.close(0_u8.into(), b"connectivity check complete");
-        Ok(info)
-    }
-
     /// Runs a benchmark and returns only its final result.
     ///
     /// # Errors
     ///
-    /// Returns a connection, negotiation, measurement, timeout, cancellation, or peer error.
-    pub async fn run(&self, peer: EndpointAddr, config: NetBenchConfig) -> Result<NetBenchReport> {
-        self.start(peer, config).await?.result().await
+    /// Returns a negotiation, measurement, timeout, cancellation, or peer error.
+    pub async fn run(
+        &self,
+        connection: Connection,
+        config: NetBenchConfig,
+    ) -> Result<NetBenchReport> {
+        self.start(connection, config).await?.result().await
     }
 
     /// Runs only the low-bandwidth latency and loss probes.
@@ -215,7 +110,7 @@ impl NetBenchClient {
     /// Returns a connection, negotiation, measurement, or peer error.
     pub async fn run_probes(
         &self,
-        peer: EndpointAddr,
+        connection: Connection,
         config: NetBenchProbeConfig,
     ) -> Result<NetBenchProbeReport> {
         let (event_tx, _event_rx) = mpsc::channel(128);
@@ -223,10 +118,8 @@ impl NetBenchClient {
         tokio::time::timeout(
             overall_timeout,
             run_probe_benchmark(
-                self.endpoint.clone(),
-                peer,
+                connection,
                 config,
-                self.connect_options.clone(),
                 &EventSink(event_tx),
                 self.connection_observer.as_ref(),
             ),
@@ -246,33 +139,29 @@ impl NetBenchClient {
         clippy::unused_async,
         reason = "keeps the documented start(...).await API"
     )]
-    pub async fn start(&self, peer: EndpointAddr, config: NetBenchConfig) -> Result<NetBenchTest> {
+    pub async fn start(
+        &self,
+        connection: Connection,
+        config: NetBenchConfig,
+    ) -> Result<NetBenchTest> {
         let (event_tx, event_rx) = mpsc::channel(128);
-        let endpoint = self.endpoint.clone();
         let connection_observer = self.connection_observer.clone();
-        let connect_options = self.connect_options.clone();
         let events = EventSink(event_tx);
         let overall_timeout = config.overall_timeout;
-        let active_connection = ActiveConnection::default();
-        let task_connection = active_connection.clone();
         let stage = BenchmarkStage::default();
         let task_stage = stage.clone();
         let task = tokio::spawn(async move {
-            let dial = BenchmarkDial {
-                endpoint,
-                peer,
-                connect_options,
-                connection_observer,
-            };
+            if let Some(observer) = connection_observer.as_ref() {
+                observer(connection.clone());
+            }
             let result = if let Ok(result) = tokio::time::timeout(
                 overall_timeout,
-                run_benchmark(dial, config, &events, &task_connection, &task_stage),
+                run_benchmark(connection, config, &events, &task_stage),
             )
             .await
             {
                 result
             } else {
-                task_connection.close(b"netbench overall timeout");
                 Err(Error::Timeout {
                     stage: task_stage.current(),
                 })
@@ -288,7 +177,6 @@ impl NetBenchClient {
             events: event_rx,
             task: Some(task),
             abort,
-            active_connection,
         })
     }
 }
@@ -299,7 +187,6 @@ pub struct NetBenchTest {
     events: mpsc::Receiver<NetBenchEvent>,
     task: Option<JoinHandle<Result<NetBenchReport>>>,
     abort: AbortHandle,
-    active_connection: ActiveConnection,
 }
 
 impl NetBenchTest {
@@ -308,11 +195,10 @@ impl NetBenchTest {
         self.events.recv().await
     }
 
-    /// Cancels the benchmark and closes its dedicated connection immediately.
+    /// Cancels the benchmark task without closing the caller-owned connection.
     ///
     /// Call [`Self::abort_and_wait`] when the caller must prove that the internal task has exited.
     pub fn cancel(&self) {
-        self.active_connection.close(b"netbench cancelled");
         self.abort.abort();
     }
 
@@ -367,30 +253,6 @@ impl Drop for NetBenchTest {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct ActiveConnection(Arc<Mutex<Option<Connection>>>);
-
-impl ActiveConnection {
-    fn register(&self, connection: &Connection) -> ActiveConnectionGuard {
-        *lock_unpoisoned(&self.0) = Some(connection.clone());
-        ActiveConnectionGuard(self.clone())
-    }
-
-    fn close(&self, reason: &'static [u8]) {
-        if let Some(connection) = lock_unpoisoned(&self.0).take() {
-            connection.close(0_u8.into(), reason);
-        }
-    }
-}
-
-struct ActiveConnectionGuard(ActiveConnection);
-
-impl Drop for ActiveConnectionGuard {
-    fn drop(&mut self) {
-        self.0.close(b"netbench task ended");
-    }
-}
-
 #[derive(Clone, Debug)]
 struct BenchmarkStage(Arc<Mutex<&'static str>>);
 
@@ -425,59 +287,25 @@ impl EventSink {
     }
 }
 
-struct BenchmarkDial {
-    endpoint: Endpoint,
-    peer: EndpointAddr,
-    connect_options: ConnectOptions,
-    connection_observer: Option<ConnectionObserver>,
-}
-
 #[allow(
     clippy::too_many_lines,
     reason = "linear ordering documents the benchmark state machine"
 )]
 async fn run_benchmark(
-    dial: BenchmarkDial,
+    connection: Connection,
     config: NetBenchConfig,
     events: &EventSink,
-    active_connection: &ActiveConnection,
     stage: &BenchmarkStage,
 ) -> Result<NetBenchReport> {
     let total_started = Instant::now();
-    events.send(NetBenchEvent::Connecting);
-    events.send(NetBenchEvent::ConnectionStage(
-        ConnectionStage::PreparingAddress,
-    ));
     let connect_started = Instant::now();
-    events.send(NetBenchEvent::ConnectionStage(
-        ConnectionStage::QuicHandshakeStarted,
-    ));
-    let connection = dial
-        .endpoint
-        .connect_with_opts(dial.peer, NETBENCH_ALPN, dial.connect_options)
-        .await
-        .map_err(Error::network)?
-        .await
-        .map_err(Error::network)?;
-    let _connection_guard = active_connection.register(&connection);
-    if let Some(observer) = dial.connection_observer.as_ref() {
-        observer(connection.clone());
-    }
-    let connect_time = connect_started.elapsed();
-    events.send(NetBenchEvent::ConnectionStage(
-        ConnectionStage::QuicHandshakeCompleted {
-            elapsed: connect_time,
-        },
-    ));
     let peer_id = connection.remote_id();
 
     stage.set("protocol negotiation");
     let (mut control_send, mut control_recv) =
         connection.open_bi().await.map_err(Error::network)?;
     prioritize_control_stream(&control_send)?;
-    events.send(NetBenchEvent::ConnectionStage(
-        ConnectionStage::ControlStreamOpened,
-    ));
+    events.send(NetBenchEvent::FlowStage(FlowStage::ControlStreamOpened));
     write_control(
         &mut control_send,
         &ControlMessage::ClientHello {
@@ -490,9 +318,7 @@ async fn run_benchmark(
         },
     )
     .await?;
-    events.send(NetBenchEvent::ConnectionStage(
-        ConnectionStage::ClientHelloSent,
-    ));
+    events.send(NetBenchEvent::FlowStage(FlowStage::ClientHelloSent));
 
     let hello = read_control(&mut control_recv).await?;
     let first_control_message_time = connect_started.elapsed();
@@ -507,11 +333,9 @@ async fn run_benchmark(
     if selected_version != PROTOCOL_VERSION {
         return Err(Error::UnsupportedProtocolVersion);
     }
-    events.send(NetBenchEvent::ConnectionStage(
-        ConnectionStage::ServerHelloReceived {
-            version: selected_version,
-        },
-    ));
+    events.send(NetBenchEvent::FlowStage(FlowStage::ServerHelloReceived {
+        version: selected_version,
+    }));
     if !capabilities.datagram_probes {
         return Err(Error::Protocol(
             "peer does not support QUIC Datagram probes".to_owned(),
@@ -520,18 +344,20 @@ async fn run_benchmark(
     validate_against_server_limits(&config, limits)?;
 
     stage.set("path stabilization");
-    let (initial_path, time_to_direct) = stabilize_path(
+    let path_at_flow_start = selected_path_kind(&connection);
+    let (initial_path, stabilization_time_to_direct) = stabilize_path(
         &connection,
         config.path_stabilization_timeout,
         connect_started,
         events,
     )
     .await;
-    events.send(NetBenchEvent::Connected(ConnectionInfo {
-        connect_time,
+    events.send(NetBenchEvent::Ready(FlowInfo {
+        negotiation_time: first_control_message_time,
         path: initial_path,
     }));
-    let path_monitor = spawn_path_monitor(connection.clone(), events.clone());
+    let (path_monitor, path_monitor_state) =
+        spawn_path_monitor(connection.clone(), events.clone(), connect_started);
 
     let before = TransportSnapshot::capture(&connection);
     let mut test_id = 1_u64;
@@ -682,10 +508,11 @@ async fn run_benchmark(
     let after = TransportSnapshot::capture(&connection);
     path_monitor.abort_and_wait().await;
     let final_path = selected_path_kind(&connection);
-    let path = if initial_path == final_path {
-        final_path
+    let path_monitor_state = lock_unpoisoned(&path_monitor_state).clone();
+    let time_to_direct = if path_at_flow_start == PathKind::Relay {
+        stabilization_time_to_direct.or(path_monitor_state.time_to_direct)
     } else {
-        PathKind::Mixed
+        None
     };
     let download_p50 = latency_report(&download_loaded.rtts).p50;
     let upload_p50 = latency_report(&upload_loaded.rtts).p50;
@@ -698,17 +525,19 @@ async fn run_benchmark(
     };
 
     control_send.finish().map_err(Error::network)?;
-    connection.close(0_u8.into(), b"netbench complete");
 
     Ok(NetBenchReport {
         schema_version: SCHEMA_VERSION,
         protocol_version: selected_version,
         peer_id,
         total_duration: total_started.elapsed(),
-        connection: ConnectionReport {
-            connect_time,
-            first_control_message_time,
-            path,
+        path: MeasurementPathReport {
+            negotiation_time: first_control_message_time,
+            initial_path,
+            final_path,
+            path_changed: path_at_flow_start != initial_path
+                || initial_path != final_path
+                || path_monitor_state.path_changed,
             became_direct: time_to_direct.is_some(),
             time_to_direct,
         },
@@ -726,47 +555,22 @@ async fn run_benchmark(
     reason = "mirrors the full benchmark negotiation while omitting all throughput phases"
 )]
 async fn run_probe_benchmark(
-    endpoint: Endpoint,
-    peer: EndpointAddr,
+    connection: Connection,
     config: NetBenchProbeConfig,
-    connect_options: ConnectOptions,
     events: &EventSink,
     connection_observer: Option<&ConnectionObserver>,
 ) -> Result<NetBenchProbeReport> {
     let total_started = Instant::now();
-    events.send(NetBenchEvent::Connecting);
-    events.send(NetBenchEvent::ConnectionStage(
-        ConnectionStage::PreparingAddress,
-    ));
     let connect_started = Instant::now();
-    events.send(NetBenchEvent::ConnectionStage(
-        ConnectionStage::QuicHandshakeStarted,
-    ));
-    let connection = endpoint
-        .connect_with_opts(peer, NETBENCH_ALPN, connect_options)
-        .await
-        .map_err(Error::network)?
-        .await
-        .map_err(Error::network)?;
-    let probe_connection = ActiveConnection::default();
-    let _connection_guard = probe_connection.register(&connection);
     if let Some(observer) = connection_observer {
         observer(connection.clone());
     }
-    let connect_time = connect_started.elapsed();
-    events.send(NetBenchEvent::ConnectionStage(
-        ConnectionStage::QuicHandshakeCompleted {
-            elapsed: connect_time,
-        },
-    ));
     let peer_id = connection.remote_id();
 
     let (mut control_send, mut control_recv) =
         connection.open_bi().await.map_err(Error::network)?;
     prioritize_control_stream(&control_send)?;
-    events.send(NetBenchEvent::ConnectionStage(
-        ConnectionStage::ControlStreamOpened,
-    ));
+    events.send(NetBenchEvent::FlowStage(FlowStage::ControlStreamOpened));
     write_control(
         &mut control_send,
         &ControlMessage::ClientHello {
@@ -779,9 +583,7 @@ async fn run_probe_benchmark(
         },
     )
     .await?;
-    events.send(NetBenchEvent::ConnectionStage(
-        ConnectionStage::ClientHelloSent,
-    ));
+    events.send(NetBenchEvent::FlowStage(FlowStage::ClientHelloSent));
 
     let hello = read_control(&mut control_recv).await?;
     let first_control_message_time = connect_started.elapsed();
@@ -796,11 +598,9 @@ async fn run_probe_benchmark(
     if selected_version != PROTOCOL_VERSION {
         return Err(Error::UnsupportedProtocolVersion);
     }
-    events.send(NetBenchEvent::ConnectionStage(
-        ConnectionStage::ServerHelloReceived {
-            version: selected_version,
-        },
-    ));
+    events.send(NetBenchEvent::FlowStage(FlowStage::ServerHelloReceived {
+        version: selected_version,
+    }));
     if !capabilities.datagram_probes {
         return Err(Error::Protocol(
             "peer does not support QUIC Datagram probes".to_owned(),
@@ -808,18 +608,20 @@ async fn run_probe_benchmark(
     }
     validate_probes_against_server_limits(&config, limits)?;
 
-    let (initial_path, time_to_direct) = stabilize_path(
+    let path_at_flow_start = selected_path_kind(&connection);
+    let (initial_path, stabilization_time_to_direct) = stabilize_path(
         &connection,
         config.path_stabilization_timeout,
         connect_started,
         events,
     )
     .await;
-    events.send(NetBenchEvent::Connected(ConnectionInfo {
-        connect_time,
+    events.send(NetBenchEvent::Ready(FlowInfo {
+        negotiation_time: first_control_message_time,
         path: initial_path,
     }));
-    let path_monitor = spawn_path_monitor(connection.clone(), events.clone());
+    let (path_monitor, path_monitor_state) =
+        spawn_path_monitor(connection.clone(), events.clone(), connect_started);
     let before = TransportSnapshot::capture(&connection);
 
     let mut test_id = 1_u64;
@@ -874,23 +676,26 @@ async fn run_probe_benchmark(
     let after = TransportSnapshot::capture(&connection);
     path_monitor.abort_and_wait().await;
     let final_path = selected_path_kind(&connection);
-    let path = if initial_path == final_path {
-        final_path
+    let path_monitor_state = lock_unpoisoned(&path_monitor_state).clone();
+    let time_to_direct = if path_at_flow_start == PathKind::Relay {
+        stabilization_time_to_direct.or(path_monitor_state.time_to_direct)
     } else {
-        PathKind::Mixed
+        None
     };
     control_send.finish().map_err(Error::network)?;
-    connection.close(0_u8.into(), b"netbench probes complete");
 
     Ok(NetBenchProbeReport {
         schema_version: SCHEMA_VERSION,
         protocol_version: selected_version,
         peer_id,
         total_duration: total_started.elapsed(),
-        connection: ConnectionReport {
-            connect_time,
-            first_control_message_time,
-            path,
+        path: MeasurementPathReport {
+            negotiation_time: first_control_message_time,
+            initial_path,
+            final_path,
+            path_changed: path_at_flow_start != initial_path
+                || initial_path != final_path
+                || path_monitor_state.path_changed,
             became_direct: time_to_direct.is_some(),
             time_to_direct,
         },
@@ -978,9 +783,9 @@ async fn stabilize_path(
     loop {
         let kind = selected_path_kind(connection);
         if previous != Some(kind) {
-            events.send(NetBenchEvent::ConnectionStage(
-                ConnectionStage::PathObserved { path: kind },
-            ));
+            events.send(NetBenchEvent::FlowStage(FlowStage::PathObserved {
+                path: kind,
+            }));
             previous = Some(kind);
         }
         if matches!(
@@ -988,51 +793,18 @@ async fn stabilize_path(
             PathKind::Direct | PathKind::DirectIpv4 | PathKind::DirectIpv6
         ) {
             let elapsed = connect_started.elapsed();
-            events.send(NetBenchEvent::ConnectionStage(
-                ConnectionStage::DirectPathSelected { elapsed },
-            ));
+            events.send(NetBenchEvent::FlowStage(FlowStage::DirectPathSelected {
+                elapsed,
+            }));
             return (kind, Some(elapsed));
         }
         if Instant::now() >= deadline {
             if kind == PathKind::Relay {
-                events.send(NetBenchEvent::ConnectionStage(
-                    ConnectionStage::RelayFallback { waited: timeout },
-                ));
+                events.send(NetBenchEvent::FlowStage(FlowStage::RelayRetained {
+                    waited: timeout,
+                }));
             }
             return (kind, None);
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-async fn observe_path_for_check(
-    connection: &Connection,
-    started: Instant,
-    timeout: Duration,
-    progress: &mut impl FnMut(ConnectionStage),
-) -> PathKind {
-    let deadline = Instant::now() + timeout;
-    let mut previous = None;
-    loop {
-        let path = selected_path_kind(connection);
-        if previous != Some(path) {
-            progress(ConnectionStage::PathObserved { path });
-            previous = Some(path);
-        }
-        if matches!(
-            path,
-            PathKind::Direct | PathKind::DirectIpv4 | PathKind::DirectIpv6
-        ) {
-            progress(ConnectionStage::DirectPathSelected {
-                elapsed: started.elapsed(),
-            });
-            return path;
-        }
-        if Instant::now() >= deadline {
-            if path == PathKind::Relay {
-                progress(ConnectionStage::RelayFallback { waited: timeout });
-            }
-            return path;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -1471,8 +1243,20 @@ fn spawn_sampler(
     }))
 }
 
-fn spawn_path_monitor(connection: Connection, events: EventSink) -> AbortOnDropTask<()> {
-    AbortOnDropTask::new(tokio::spawn(async move {
+#[derive(Clone, Debug, Default)]
+struct PathMonitorState {
+    path_changed: bool,
+    time_to_direct: Option<Duration>,
+}
+
+fn spawn_path_monitor(
+    connection: Connection,
+    events: EventSink,
+    flow_started: Instant,
+) -> (AbortOnDropTask<()>, Arc<Mutex<PathMonitorState>>) {
+    let state = Arc::new(Mutex::new(PathMonitorState::default()));
+    let task_state = Arc::clone(&state);
+    let task = AbortOnDropTask::new(tokio::spawn(async move {
         let mut previous = selected_path_kind(&connection);
         let mut ticker = tokio::time::interval(Duration::from_millis(250));
         loop {
@@ -1482,13 +1266,26 @@ fn spawn_path_monitor(connection: Connection, events: EventSink) -> AbortOnDropT
             }
             let current = selected_path_kind(&connection);
             if current != previous {
-                events.send(NetBenchEvent::ConnectionStage(
-                    ConnectionStage::PathObserved { path: current },
-                ));
+                let mut state = lock_unpoisoned(&task_state);
+                state.path_changed = true;
+                if previous == PathKind::Relay
+                    && matches!(
+                        current,
+                        PathKind::Direct | PathKind::DirectIpv4 | PathKind::DirectIpv6
+                    )
+                    && state.time_to_direct.is_none()
+                {
+                    state.time_to_direct = Some(flow_started.elapsed());
+                }
+                drop(state);
+                events.send(NetBenchEvent::FlowStage(FlowStage::PathObserved {
+                    path: current,
+                }));
                 previous = current;
             }
         }
-    }))
+    }));
+    (task, state)
 }
 
 #[derive(Debug)]

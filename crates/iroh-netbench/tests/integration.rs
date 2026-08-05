@@ -8,15 +8,20 @@ use iroh::{
     protocol::Router,
 };
 use iroh_netbench::{
-    Error, NETBENCH_ALPN, NetBenchClient, NetBenchConfig, NetBenchEvent, NetBenchProbeConfig,
-    NetBenchProtocol, PROTOCOL_VERSION, PathKind, SessionMonitor, SessionMonitorConfig,
+    Error, NETBENCH_ALPN, NetBenchConfig, NetBenchEvent, NetBenchInitiator, NetBenchProbeConfig,
+    NetBenchProtocol, PROTOCOL_VERSION, SCHEMA_VERSION, SessionMonitor, SessionMonitorConfig,
     ThroughputPolicy,
 };
+
+async fn connect(endpoint: &Endpoint, peer: EndpointAddr) -> iroh::endpoint::Connection {
+    endpoint.connect(peer, NETBENCH_ALPN).await.unwrap()
+}
 
 #[test]
 fn public_protocol_identity_is_stable() {
     assert_eq!(NETBENCH_ALPN, b"/iroh/netbench/1");
     assert_eq!(PROTOCOL_VERSION, 1);
+    assert_eq!(SCHEMA_VERSION, 2);
     assert_eq!(NetBenchProtocol::default().max_parallel_streams(), 8);
     assert_eq!(
         NetBenchProtocol::default().throughput_policy(),
@@ -36,7 +41,7 @@ fn throughput_policy_is_shared_by_protocol_clones() {
 }
 
 #[tokio::test]
-async fn client_dial_policy_and_server_peer_authorization_are_enforced() {
+async fn caller_dials_and_server_peer_authorization_is_enforced() {
     let authorized = Endpoint::builder(presets::Minimal)
         .clear_ip_transports()
         .bind_addr("127.0.0.1:0")
@@ -78,18 +83,40 @@ async fn client_dial_policy_and_server_peer_authorization_are_enforced() {
     let target = EndpointAddr::from_parts(server.id(), [TransportAddr::Ip(server_v4)]);
     let policy = DialPolicy::supplied_only(DialPathFilter::DIRECT_IPV4);
 
-    let info = NetBenchClient::new(authorized.clone())
-        .with_dial_policy(policy)
-        .check_with_progress_timeout(target.clone(), Duration::ZERO, |_| {})
+    let options = iroh::endpoint::ConnectOptions::new().with_dial_policy(policy);
+    let allowed_connection = authorized
+        .connect_with_opts(target.clone(), NETBENCH_ALPN, options.clone())
+        .await
+        .unwrap()
         .await
         .unwrap();
-    assert_eq!(info.path, PathKind::DirectIpv4);
+    assert!(
+        allowed_connection
+            .paths()
+            .iter()
+            .any(|path| path.is_selected() && path.is_ip())
+    );
+    let mut probes = NetBenchProbeConfig::quick();
+    probes.path_stabilization_timeout = Duration::ZERO;
+    probes.latency_duration = Duration::from_millis(50);
+    probes.loss_duration = Duration::from_millis(50);
+    NetBenchInitiator::new()
+        .run_probes(allowed_connection.clone(), probes.clone())
+        .await
+        .unwrap();
 
-    let denied = NetBenchClient::new(unauthorized.clone())
-        .with_dial_policy(policy)
-        .check_with_progress_timeout(target, Duration::ZERO, |_| {})
+    let denied_connection = unauthorized
+        .connect_with_opts(target, NETBENCH_ALPN, options)
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    let denied = NetBenchInitiator::new()
+        .run_probes(denied_connection.clone(), probes)
         .await;
     assert!(denied.is_err());
+    allowed_connection.close(0_u8.into(), b"test complete");
+    denied_connection.close(0_u8.into(), b"test complete");
 
     router.shutdown().await.unwrap();
     authorized.close().await;
@@ -141,9 +168,10 @@ async fn local_endpoints_complete_a_real_benchmark() {
 
     let client_monitor = SessionMonitor::spawn(monitor_config);
     let wall_started = tokio::time::Instant::now();
-    let report = NetBenchClient::new(client_endpoint.clone())
+    let connection = connect(&client_endpoint, server.addr()).await;
+    let report = NetBenchInitiator::new()
         .with_monitor(client_monitor.clone())
-        .run(server.addr(), config)
+        .run(connection.clone(), config)
         .await
         .unwrap();
     assert!(report.idle_latency.samples > 0);
@@ -164,6 +192,7 @@ async fn local_endpoints_complete_a_real_benchmark() {
     assert_eq!(server_metrics.connections[0].label, "netbench-server");
     assert!(client_metrics.total_rx_bytes > 0);
     assert!(client_metrics.total_tx_bytes > 0);
+    connection.close(0_u8.into(), b"test complete");
 
     router.shutdown().await.unwrap();
     client_endpoint.close().await;
@@ -184,10 +213,8 @@ async fn full_benchmark_can_be_cancelled_and_joined() {
         .bind()
         .await
         .unwrap();
-    let (connection_tx, mut connection_rx) = tokio::sync::mpsc::unbounded_channel();
-    let client = NetBenchClient::new(client_endpoint.clone()).on_connection(move |connection| {
-        let _ = connection_tx.send(connection);
-    });
+    let connection = connect(&client_endpoint, server.addr()).await;
+    let client = NetBenchInitiator::new();
 
     let mut config = NetBenchConfig::quick();
     config.overall_timeout = Duration::from_secs(20);
@@ -199,11 +226,7 @@ async fn full_benchmark_can_be_cancelled_and_joined() {
     config.probe_timeout = Duration::from_millis(100);
     config.download_warmup = Duration::ZERO;
     config.download_duration = Duration::from_secs(10);
-    let mut test = client.start(server.addr(), config).await.unwrap();
-    let connection = tokio::time::timeout(Duration::from_secs(2), connection_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
+    let mut test = client.start(connection.clone(), config).await.unwrap();
     loop {
         let event = tokio::time::timeout(Duration::from_secs(2), test.next())
             .await
@@ -220,16 +243,19 @@ async fn full_benchmark_can_be_cancelled_and_joined() {
         .await
         .unwrap()
         .unwrap();
-    tokio::time::timeout(Duration::from_secs(2), connection.closed())
-        .await
-        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), connection.closed())
+            .await
+            .is_err()
+    );
+    connection.close(0_u8.into(), b"test complete");
 
     router.shutdown().await.unwrap();
     client_endpoint.close().await;
 }
 
 #[tokio::test]
-async fn overall_timeout_reports_stage_and_closes_connection() {
+async fn overall_timeout_reports_stage_without_closing_connection() {
     let server = Endpoint::builder(presets::Minimal)
         .relay_mode(RelayMode::Disabled)
         .bind()
@@ -243,26 +269,26 @@ async fn overall_timeout_reports_stage_and_closes_connection() {
         .bind()
         .await
         .unwrap();
-    let (connection_tx, mut connection_rx) = tokio::sync::mpsc::unbounded_channel();
-    let client = NetBenchClient::new(client_endpoint.clone()).on_connection(move |connection| {
-        let _ = connection_tx.send(connection);
-    });
+    let connection = connect(&client_endpoint, server.addr()).await;
+    let client = NetBenchInitiator::new();
 
     let mut config = NetBenchConfig::quick();
     config.overall_timeout = Duration::from_secs(1);
     config.path_stabilization_timeout = Duration::ZERO;
     config.latency_duration = Duration::from_secs(10);
-    let result = client.run(server.addr(), config).await;
+    let result = client.run(connection.clone(), config).await;
     assert!(matches!(
         result,
         Err(Error::Timeout {
             stage: "idle latency"
         })
     ));
-    let connection = connection_rx.recv().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(2), connection.closed())
-        .await
-        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), connection.closed())
+            .await
+            .is_err()
+    );
+    connection.close(0_u8.into(), b"test complete");
 
     router.shutdown().await.unwrap();
     client_endpoint.close().await;
@@ -283,10 +309,8 @@ async fn dropping_run_future_cancels_the_internal_task() {
         .bind()
         .await
         .unwrap();
-    let (connection_tx, mut connection_rx) = tokio::sync::mpsc::unbounded_channel();
-    let client = NetBenchClient::new(client_endpoint.clone()).on_connection(move |connection| {
-        let _ = connection_tx.send(connection);
-    });
+    let connection = connect(&client_endpoint, server.addr()).await;
+    let client = NetBenchInitiator::new();
 
     let mut config = NetBenchConfig::quick();
     config.overall_timeout = Duration::from_secs(20);
@@ -294,14 +318,16 @@ async fn dropping_run_future_cancels_the_internal_task() {
     config.latency_duration = Duration::from_secs(10);
     let outer = tokio::time::timeout(
         Duration::from_millis(300),
-        client.run(server.addr(), config),
+        client.run(connection.clone(), config),
     )
     .await;
     assert!(outer.is_err());
-    let connection = connection_rx.recv().await.unwrap();
-    tokio::time::timeout(Duration::from_secs(2), connection.closed())
-        .await
-        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), connection.closed())
+            .await
+            .is_err()
+    );
+    connection.close(0_u8.into(), b"test complete");
 
     router.shutdown().await.unwrap();
     client_endpoint.close().await;
@@ -325,10 +351,11 @@ async fn denied_throughput_fails_early_but_probe_only_still_completes() {
         .bind()
         .await
         .unwrap();
-    let client = NetBenchClient::new(client_endpoint.clone());
+    let client = NetBenchInitiator::new();
 
+    let full_connection = connect(&client_endpoint, server.addr()).await;
     let mut full_test = client
-        .start(server.addr(), NetBenchConfig::quick())
+        .start(full_connection.clone(), NetBenchConfig::quick())
         .await
         .unwrap();
     let mut measurement_started = false;
@@ -356,13 +383,16 @@ async fn denied_throughput_fails_early_but_probe_only_still_completes() {
     probe_config.loss_duration = Duration::from_millis(200);
     probe_config.loss_rate_per_second = 20;
     probe_config.probe_timeout = Duration::from_millis(300);
+    let probe_connection = connect(&client_endpoint, server.addr()).await;
     let report = client
-        .run_probes(server.addr(), probe_config)
+        .run_probes(probe_connection.clone(), probe_config)
         .await
         .unwrap();
     assert_eq!(report.protocol_version, PROTOCOL_VERSION);
     assert!(report.idle_latency.samples > 0);
     assert!(report.loss.sent > 0);
+    full_connection.close(0_u8.into(), b"test complete");
+    probe_connection.close(0_u8.into(), b"test complete");
 
     router.shutdown().await.unwrap();
     client_endpoint.close().await;

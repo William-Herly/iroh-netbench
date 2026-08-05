@@ -6,18 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{NetBenchReport, PathKind};
 
-/// Fine-grained connection and negotiation progress.
+/// Fine-grained benchmark-flow negotiation and path progress.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ConnectionStage {
-    /// The supplied `EndpointAddr` is being prepared for dialing.
-    PreparingAddress,
-    /// iroh has started QUIC/TLS establishment over available paths.
-    QuicHandshakeStarted,
-    /// Authenticated QUIC establishment completed.
-    QuicHandshakeCompleted {
-        /// Elapsed time since dialing started.
-        elapsed: Duration,
-    },
+pub enum FlowStage {
     /// The reliable bidirectional control stream was opened.
     ControlStreamOpened,
     /// Client versions and capabilities were sent.
@@ -32,24 +23,24 @@ pub enum ConnectionStage {
         /// Current selected path.
         path: PathKind,
     },
-    /// A direct path was selected after connection establishment.
+    /// A direct path was selected after the business flow started.
     DirectPathSelected {
-        /// Time since dialing started.
+        /// Time since the business flow started.
         elapsed: Duration,
     },
     /// Direct-path waiting expired and Relay remains selected.
-    RelayFallback {
+    RelayRetained {
         /// Time spent waiting for Direct.
         waited: Duration,
     },
 }
 
-/// Connection details available immediately after the handshake.
+/// Business-flow details available after protocol negotiation and path stabilization.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConnectionInfo {
-    /// Time spent establishing the connection.
-    pub connect_time: Duration,
-    /// Path observed at connection time.
+pub struct FlowInfo {
+    /// Time spent negotiating the benchmark protocol.
+    pub negotiation_time: Duration,
+    /// Path observed at measurement start.
     pub path: PathKind,
 }
 
@@ -102,12 +93,10 @@ pub struct ThroughputSample {
 )]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum NetBenchEvent {
-    /// Outgoing connection has started.
-    Connecting,
-    /// One detailed connection/negotiation milestone.
-    ConnectionStage(ConnectionStage),
-    /// Connection and version negotiation completed.
-    Connected(ConnectionInfo),
+    /// One detailed business-flow negotiation/path milestone.
+    FlowStage(FlowStage),
+    /// Business-flow negotiation completed.
+    Ready(FlowInfo),
     /// Idle latency measurement started.
     LatencyStarted,
     /// One idle RTT was observed.

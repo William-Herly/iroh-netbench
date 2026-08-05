@@ -2,8 +2,8 @@
 resolver = "2"
 members = [
     "crates/iroh-netbench",
-    "crates/transfer-demo",
 ]
+exclude = ["crates/transfer-demo"]
 default-members = ["crates/iroh-netbench"]
 
 [workspace.package]
@@ -14,19 +14,14 @@ rust-version = "1.91"
 
 [workspace.dependencies]
 bytes = "1.10"
-data-encoding = "2.9"
-eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 futures-lite = "2.6"
 iroh = { path = "../iroh/iroh" }
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
-rustls-pki-types = "1.15"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
-tokio = { version = "1.47", features = ["fs", "io-util", "macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-url = "2.5"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

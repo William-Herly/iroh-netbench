@@ -1,6 +1,6 @@
 [package]
 name = "iroh-netbench"
-description = "Application-level network benchmarking over a dedicated iroh QUIC connection"
+description = "Application-level network benchmarking inside a caller-owned iroh QUIC connection"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

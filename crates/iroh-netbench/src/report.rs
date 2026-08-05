@@ -22,18 +22,20 @@ pub enum PathKind {
     Unknown,
 }
 
-/// Connection establishment and path selection.
+/// Path observations made during the benchmark business flow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConnectionReport {
-    /// Time until the QUIC connection completed.
-    pub connect_time: Duration,
-    /// Time until the first control response was received.
-    pub first_control_message_time: Duration,
-    /// Effective path classification.
-    pub path: PathKind,
+pub struct MeasurementPathReport {
+    /// Time from starting the business flow until the first control response.
+    pub negotiation_time: Duration,
+    /// Selected path at the start of the measurement window.
+    pub initial_path: PathKind,
+    /// Selected path at the end of the measurement window.
+    pub final_path: PathKind,
+    /// Whether the selected path changed during the flow.
+    pub path_changed: bool,
     /// Whether a relay-to-direct transition was seen.
     pub became_direct: bool,
-    /// Time from connection start until the first direct path.
+    /// Time from business-flow start until the first direct path.
     pub time_to_direct: Option<Duration>,
 }
 
@@ -137,8 +139,8 @@ pub struct NetBenchReport {
     pub peer_id: EndpointId,
     /// Wall-clock duration of the run.
     pub total_duration: Duration,
-    /// Connection and path details.
-    pub connection: ConnectionReport,
+    /// Path details observed during the benchmark flow.
+    pub path: MeasurementPathReport,
     /// Idle latency.
     pub idle_latency: LatencyReport,
     /// Application probe timeout results.
@@ -164,8 +166,8 @@ pub struct NetBenchProbeReport {
     pub peer_id: EndpointId,
     /// Wall-clock duration of the run.
     pub total_duration: Duration,
-    /// Connection establishment and selected path details.
-    pub connection: ConnectionReport,
+    /// Path details observed during the probe flow.
+    pub path: MeasurementPathReport,
     /// Idle latency and jitter.
     pub idle_latency: LatencyReport,
     /// Application Datagram timeout results.

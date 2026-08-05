@@ -8,19 +8,17 @@ English | [中文](README.zh-CN.md)
 A small embeddable Rust component for benchmarking and monitoring
 [iroh](https://github.com/n0-computer/iroh) QUIC connections.
 
-`iroh-netbench` reuses an application's existing `Endpoint`. It mounts a benchmark protocol on
-the application's Router and opens a dedicated connection only when a test is requested.
+`iroh-netbench` runs benchmark business flows on a host-established iroh `Connection`. It does not
+own an `Endpoint`, resolve peer addresses, dial, choose a path policy, or close the connection.
 
-> Status: `0.1.0` is published on crates.io, with wire protocol v1. The reusable library passed its
+> Status: the maintained branch uses wire protocol v1 and report schema v2. The reusable library passed its
 > Direct, Relay and impaired-path acceptance matrix. Rust APIs may still evolve while the crate
 > remains below `1.0`.
 
 ## Release scope
 
-The first public artifact is the `iroh-netbench` library crate. `transfer-demo` remains an internal
-test host: it is not published to crates.io, and its desktop packaging scripts intentionally embed
-private infrastructure configuration and a private CA. Do not distribute those demo archives as
-public release assets.
+The buildable workspace contains only the `iroh-netbench` library crate. The legacy
+`transfer-demo` is excluded from the workspace and does not define or validate the new API.
 
 The library does not create or own Relay, discovery, PKARR or certificate infrastructure. The host
 application supplies a configured `Endpoint` and decides which peer addresses and paths are
@@ -79,20 +77,22 @@ let router = Router::builder(endpoint.clone())
 For a benchmark initiated by A against B:
 
 ```text
-A: NetBenchClient
+A: iroh dial + NetBenchInitiator
 B: NetBenchProtocol
 ```
 
 A does not need to mount the protocol for this run; B does. If B must also initiate benchmarks
-against A, both peers mount `NetBenchProtocol` and create a `NetBenchClient` when initiating a run.
+against A, both peers mount `NetBenchProtocol`, establish a connection, and create a
+`NetBenchInitiator` when initiating a run.
 
 ## Run a benchmark
 
 ```rust,ignore
-use iroh_netbench::{NetBenchClient, NetBenchConfig};
+use iroh_netbench::{NETBENCH_ALPN, NetBenchConfig, NetBenchInitiator};
 
-let report = NetBenchClient::new(endpoint.clone())
-    .run(peer_addr, NetBenchConfig::standard())
+let connection = endpoint.connect(peer_addr, NETBENCH_ALPN).await?;
+let report = NetBenchInitiator::new()
+    .run(connection.clone(), NetBenchConfig::standard())
     .await?;
 
 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -101,8 +101,8 @@ println!("{}", serde_json::to_string_pretty(&report)?);
 For live progress:
 
 ```rust,ignore
-let client = NetBenchClient::new(endpoint.clone());
-let mut test = client.start(peer_addr, NetBenchConfig::quick()).await?;
+let client = NetBenchInitiator::new();
+let mut test = client.start(connection.clone(), NetBenchConfig::quick()).await?;
 
 while let Some(event) = test.next().await {
     update_ui(event);
@@ -111,9 +111,8 @@ while let Some(event) = test.next().await {
 let report = test.result().await?;
 ```
 
-`NetBenchClient` uses the shared `Endpoint` but creates a dedicated `/iroh/netbench/1`
-connection. One benchmark connection contains a control stream, parallel upload/download streams
-and Datagram probes.
+The existing connection carries the netbench control stream, parallel upload/download streams and
+Datagram probes. `report.path` describes the measurement window; the host records dialing facts.
 
 ### Bounded duration and cancellation
 
@@ -128,24 +127,24 @@ bandwidth-saturating payload. Per-phase cleanup has a five-second hard bound; th
 control delivery, not extra measurement time.
 
 `NetBenchConfig::quick()` has a 45-second overall hard limit and `standard()` has a 75-second
-limit. `overall_timeout` includes connection setup, path stabilization, measurements and bounded
-cleanup. A timeout returns `Error::Timeout { stage }` and closes the dedicated benchmark
+limit. `overall_timeout` includes protocol negotiation, path stabilization, measurements and
+bounded cleanup. A timeout returns `Error::Timeout { stage }` without closing the caller-owned
 connection. The receiver also applies the requested duration as a runtime limit; its
 `max_test_duration` is not only request validation.
 
 A running full benchmark can be stopped explicitly and joined:
 
 ```rust,ignore
-let test = client.start(peer_addr, NetBenchConfig::quick()).await?;
+let test = client.start(connection.clone(), NetBenchConfig::quick()).await?;
 
 // Called when the user cancels or an outer operation is being torn down.
 test.cancel();
 test.abort_and_wait().await?;
 ```
 
-Dropping `NetBenchTest` or a pending `run()` future also closes the benchmark connection and
-aborts its internal tasks. Use `abort_and_wait()` when the caller must prove task termination
-before continuing.
+Dropping `NetBenchTest` or a pending `run()` future aborts its internal tasks and streams but leaves
+the caller-owned connection open. Use `abort_and_wait()` when the caller must prove task
+termination before continuing.
 
 ### Low-bandwidth probes
 
@@ -154,8 +153,8 @@ Latency, jitter and Datagram timeout measurements can run without opening throug
 ```rust,ignore
 use iroh_netbench::NetBenchProbeConfig;
 
-let report = NetBenchClient::new(endpoint.clone())
-    .run_probes(peer_addr, NetBenchProbeConfig::quick())
+let report = NetBenchInitiator::new()
+    .run_probes(connection.clone(), NetBenchProbeConfig::quick())
     .await?;
 ```
 
@@ -198,13 +197,11 @@ For a run initiated by A against B, the control roles remain fixed:
 
 ### Connection path selection
 
-NetBench creates a dedicated temporary iroh Connection with its own ALPN. Its selected path is not
-inherited from an existing application `PeerSession`: supplying a complete `EndpointAddr` can let
-the temporary connection select Relay even when another connection to the same peer is Direct.
-
-If a product requires Direct-only or Relay-only measurement, filter the target address before
-calling the client and verify `report.connection.path` afterwards. Do not infer the benchmark path
-only from an existing session.
+The host owns candidate selection, Direct/Relay policy and dialing. Netbench accepts neither an
+`EndpointAddr` nor a dial policy. `report.path.initial_path`, `final_path`, and `path_changed`
+describe only the benchmark business-flow window. `path_changed` covers transient changes even
+when the final path equals the initial path. `became_direct` and `time_to_direct` are set only when
+the flow entered on a non-Direct path and first reached Direct during stabilization or measurement.
 
 Low-bandwidth probes are the recommended default diagnostic on unqualified or bandwidth-sensitive
 paths. Full throughput should be opt-in and subject to the receiver's policy.
@@ -257,7 +254,7 @@ let protocol = NetBenchProtocol::builder()
     .with_monitor(monitor.clone())
     .build();
 
-let client = NetBenchClient::new(endpoint.clone())
+let client = NetBenchInitiator::new()
     .with_monitor(monitor.clone());
 ```
 

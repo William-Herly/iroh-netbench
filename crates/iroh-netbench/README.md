@@ -3,12 +3,11 @@
 Embeddable latency, Datagram timeout, throughput and transport diagnostics for
 [iroh](https://github.com/n0-computer/iroh) QUIC connections.
 
-> `0.1.0` is the first preview release. The wire protocol and report schema are version `1`;
+> The maintained branch uses wire protocol version `1` and report schema version `2`;
 > Rust APIs may still evolve while the crate remains below `1.0`.
 
-`iroh-netbench` reuses an application's existing `iroh::Endpoint`. The responder mounts
-`NetBenchProtocol` on its Router, while the initiator creates a `NetBenchClient`. Each run uses a
-dedicated `/iroh/netbench/1` connection and does not take ownership of the host Endpoint.
+The responder mounts `NetBenchProtocol` on its Router. The host establishes an iroh `Connection`
+and passes that same connection to `NetBenchInitiator`; netbench never dials or owns its lifecycle.
 
 ## Capabilities
 
@@ -31,14 +30,15 @@ iroh-netbench = "0.1.0"
 
 ```rust,ignore
 use iroh::protocol::Router;
-use iroh_netbench::{NETBENCH_ALPN, NetBenchClient, NetBenchConfig, NetBenchProtocol};
+use iroh_netbench::{NETBENCH_ALPN, NetBenchConfig, NetBenchInitiator, NetBenchProtocol};
 
 let router = Router::builder(endpoint.clone())
     .accept(NETBENCH_ALPN, NetBenchProtocol::default())
     .spawn();
 
-let report = NetBenchClient::new(endpoint.clone())
-    .run(peer_addr, NetBenchConfig::quick())
+let connection = endpoint.connect(peer_addr, NETBENCH_ALPN).await?;
+let report = NetBenchInitiator::new()
+    .run(connection.clone(), NetBenchConfig::quick())
     .await?;
 ```
 
@@ -63,9 +63,8 @@ higher QUIC scheduling priority than throughput streams, cleanup remains bounded
 Standard have 45-second and 75-second whole-run deadlines. `NetBenchTest::abort_and_wait()` gives
 callers an explicit cancellation and join boundary.
 
-The benchmark connection selects its own Direct or Relay path from the supplied `EndpointAddr`.
-Callers that require a specific path should filter that address before dialing and inspect the
-final `ConnectionReport.path`.
+The host owns Direct/Relay policy and dialing. `report.path` describes only the initial/final path
+and transitions observed during the benchmark measurement window.
 
 ## More documentation
 

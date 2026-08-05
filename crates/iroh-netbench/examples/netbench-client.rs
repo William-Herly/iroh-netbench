@@ -3,7 +3,7 @@
 use std::{env, error::Error};
 
 use iroh::{Endpoint, EndpointAddr, RelayMode, endpoint::presets};
-use iroh_netbench::{NetBenchClient, NetBenchConfig};
+use iroh_netbench::{NETBENCH_ALPN, NetBenchConfig, NetBenchInitiator};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -16,11 +16,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .bind()
         .await?;
 
-    let report = NetBenchClient::new(endpoint.clone())
-        .run(peer, NetBenchConfig::quick())
+    let connection = endpoint.connect(peer, NETBENCH_ALPN).await?;
+    let report = NetBenchInitiator::new()
+        .run(connection.clone(), NetBenchConfig::quick())
         .await?;
     println!("{}", serde_json::to_string_pretty(&report)?);
 
+    connection.close(0_u8.into(), b"example complete");
     endpoint.close().await;
     Ok(())
 }

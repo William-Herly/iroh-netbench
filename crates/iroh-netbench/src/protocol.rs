@@ -400,7 +400,6 @@ impl ProtocolHandler for NetBenchProtocol {
             .allowed_peer
             .is_some_and(|allowed| connection.remote_id() != allowed)
         {
-            connection.close(0_u8.into(), b"netbench peer is not authorized");
             return Err(AcceptError::from_err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "netbench peer is not authorized",
@@ -409,12 +408,15 @@ impl ProtocolHandler for NetBenchProtocol {
         if let Some(observer) = &self.connection_observer {
             observer(connection.clone());
         }
-        let result = self
-            .handle(connection.clone())
-            .await
-            .map_err(|error| AcceptError::from_err(std::io::Error::other(error.to_string())));
-        connection.close(0_u8.into(), b"netbench server task ended");
-        result
+        loop {
+            match self.handle(connection.clone()).await {
+                Ok(()) => {}
+                Err(_) if connection.close_reason().is_some() => return Ok(()),
+                Err(error) => {
+                    tracing::debug!(%error, "netbench business flow ended with an error; keeping the caller-owned connection open");
+                }
+            }
+        }
     }
 }
 

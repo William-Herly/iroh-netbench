@@ -8,16 +8,16 @@
 一个用于测试和监控 [iroh](https://github.com/n0-computer/iroh) QUIC 连接的轻量 Rust
 组件。
 
-`iroh-netbench` 复用宿主应用已有的 `Endpoint`。宿主在 Router 中挂载测速协议，只有用户发起测速时才会建立一条独立的 NetBench Connection。
+`iroh-netbench` 只在宿主已经建立好的 iroh `Connection` 内运行测速业务流。它不持有
+`Endpoint`、不解析对端地址、不拨号、不选择建联策略，也不关闭整条 Connection。
 
-> 当前状态：`0.1.0` 已发布到 crates.io，线协议 v1。可复用库已经通过 Direct、Relay 和受损
+> 当前维护分支使用线协议 v1、报告 schema v2。可复用库已经通过 Direct、Relay 和受损
 > 链路验收矩阵；在 crate 达到 `1.0` 前，Rust API 仍可能调整。
 
 ## 发布范围
 
-首个公开产物只包含 `iroh-netbench` 库 crate。`transfer-demo` 继续作为内部测试宿主，不发布到
-crates.io；它的桌面打包脚本会有意嵌入私有基础设施配置和私有 CA，不能把这些 demo 压缩包
-作为公开 release 资产分发。
+可构建 workspace 只包含 `iroh-netbench` 库 crate。旧 `transfer-demo` 已从 workspace 移出，
+不发布、不参与新 API 验证；其源码仅作历史参考。
 
 库本身不创建或持有 Relay、Discovery、PKARR 或证书基础设施。宿主应用负责提供已配置的
 `Endpoint`，并决定哪些对端地址和路径允许进行完整吞吐测速。
@@ -74,20 +74,22 @@ let router = Router::builder(endpoint.clone())
 例如 A 发起测速 B：
 
 ```text
-A：NetBenchClient
+A：iroh 建联 + NetBenchInitiator
 B：NetBenchProtocol
 ```
 
 A 不需要为了本次测速挂载协议；B 必须挂载。如果 B 也需要主动测速 A，则 A、B 两端
-都应挂载 `NetBenchProtocol`，并在发起测速时各自创建 `NetBenchClient`。
+都应挂载 `NetBenchProtocol`，并在发起测速时先由宿主建立 Connection，再创建
+`NetBenchInitiator`。
 
 ## 运行测速
 
 ```rust,ignore
-use iroh_netbench::{NetBenchClient, NetBenchConfig};
+use iroh_netbench::{NETBENCH_ALPN, NetBenchConfig, NetBenchInitiator};
 
-let report = NetBenchClient::new(endpoint.clone())
-    .run(peer_addr, NetBenchConfig::standard())
+let connection = endpoint.connect(peer_addr, NETBENCH_ALPN).await?;
+let report = NetBenchInitiator::new()
+    .run(connection.clone(), NetBenchConfig::standard())
     .await?;
 
 println!("{}", serde_json::to_string_pretty(&report)?);
@@ -96,8 +98,8 @@ println!("{}", serde_json::to_string_pretty(&report)?);
 需要实时进度时：
 
 ```rust,ignore
-let client = NetBenchClient::new(endpoint.clone());
-let mut test = client.start(peer_addr, NetBenchConfig::quick()).await?;
+let client = NetBenchInitiator::new();
+let mut test = client.start(connection.clone(), NetBenchConfig::quick()).await?;
 
 while let Some(event) = test.next().await {
     update_ui(event);
@@ -106,8 +108,9 @@ while let Some(event) = test.next().await {
 let report = test.result().await?;
 ```
 
-`NetBenchClient` 复用宿主 Endpoint，但会创建一条独立的 `/iroh/netbench/1`
-Connection。该连接包含控制 Stream、并行上传/下载 Stream 和 Datagram Probe。
+同一个 Connection 内包含 netbench 控制 Stream、并行上传/下载 Stream 和 Datagram Probe。
+`report.path` 只描述业务流测量窗口内的初始路径、最终路径和迁移；QUIC 建联耗时及候选信息应由
+创建 Connection 的宿主记录。
 
 ### 有界时长与取消
 
@@ -121,8 +124,8 @@ payload。
 上限；这段时间只用于控制消息送达，不会计入测速窗口。
 
 `NetBenchConfig::quick()` 的整轮硬上限为 45 秒，`standard()` 为 75 秒。
-`overall_timeout` 包含建联、路径稳定、各测量阶段和有界收尾；超时会返回带当前阶段名的
-`Error::Timeout { stage }`，并关闭专用测速 Connection。接收端也会把请求时长用于约束实际
+`overall_timeout` 包含协议协商、路径稳定、各测量阶段和有界收尾；超时会返回带当前阶段名的
+`Error::Timeout { stage }`，但不会关闭调用方持有的 Connection。接收端也会把请求时长用于约束实际
 吞吐阶段，`max_test_duration` 不再只是请求参数校验。
 
 完整测速任务可以显式取消并等待退出：
@@ -135,8 +138,9 @@ test.cancel();
 test.abort_and_wait().await?;
 ```
 
-直接丢弃 `NetBenchTest` 或仍在等待的 `run()` future，也会关闭测速 Connection 并终止内部
-任务。如果调用方必须在继续前证明任务已经退出，应使用 `abort_and_wait()`。
+直接丢弃 `NetBenchTest` 或仍在等待的 `run()` future 会终止 netbench 内部任务和 Stream，整条
+Connection 的后续处置仍由宿主决定。如果调用方必须在继续前证明任务已经退出，应使用
+`abort_and_wait()`。
 
 ### 低带宽探测
 
@@ -145,8 +149,8 @@ test.abort_and_wait().await?;
 ```rust,ignore
 use iroh_netbench::NetBenchProbeConfig;
 
-let report = NetBenchClient::new(endpoint.clone())
-    .run_probes(peer_addr, NetBenchProbeConfig::quick())
+let report = NetBenchInitiator::new()
+    .run_probes(connection.clone(), NetBenchProbeConfig::quick())
     .await?;
 ```
 
@@ -187,12 +191,12 @@ Standard 以及其他完整吞吐测试会在任何测量开始前返回
 
 ### Connection 路径选择
 
-NetBench 会使用专用 ALPN 创建一条临时 iroh Connection，它不会继承现有应用
-`PeerSession` 的路径。即使应用已有 Direct Session，只要传入的完整 `EndpointAddr` 包含
-Relay，临时测速 Connection 仍可能选择 Relay。
-
-如果产品只允许 Direct-only 或 Relay-only 测量，应在调用客户端前过滤目标地址，并在完成后
-检查 `report.connection.path`，不能只依据已有 Session 判断本轮测速路径。
+路径候选、Direct/Relay 约束和建联结果完全由宿主负责。netbench 不接受 `EndpointAddr` 或
+`DialPolicy`。测速完成后可读取 `report.path.initial_path`、`final_path` 和 `path_changed`，了解
+业务流窗口内是否发生路径迁移；即使最终路径回到初始路径，中间发生过切换时
+`path_changed` 仍为 `true`。只有业务流从非 Direct 路径进入、随后在稳定或测量阶段首次转为
+Direct 时，`became_direct` 才为 `true`，`time_to_direct` 记录该时刻。它们不能代替宿主记录的
+建联候选和握手结果。
 
 对于尚未确认或对带宽敏感的路径，建议默认使用低带宽 Probe。完整吞吐测速应由用户明确
 触发，并服从被测端的 `ThroughputPolicy`。
@@ -243,7 +247,7 @@ let protocol = NetBenchProtocol::builder()
     .with_monitor(monitor.clone())
     .build();
 
-let client = NetBenchClient::new(endpoint.clone())
+let client = NetBenchInitiator::new()
     .with_monitor(monitor.clone());
 ```
 
