@@ -173,7 +173,7 @@ let protocol = NetBenchProtocol::builder()
 protocol.set_throughput_policy(ThroughputPolicy::Allow);
 ```
 
-为保持兼容，默认值是 `Allow`。设置为 `Deny` 后，连通性检查和 `run_probes` 仍可运行；Quick、
+独立协议的明确默认值是 `Allow`。设置为 `Deny` 后，连通性检查和 `run_probes` 仍可运行；Quick、
 Standard 以及其他完整吞吐测试会在任何测量开始前返回
 `Error::ThroughputDeniedByPeer`，客户端不会静默降级测试内容。
 

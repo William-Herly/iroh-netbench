@@ -177,7 +177,7 @@ let protocol = NetBenchProtocol::builder()
 protocol.set_throughput_policy(ThroughputPolicy::Allow);
 ```
 
-`Allow` is the default for backwards compatibility. Under `Deny`, connectivity checks and
+`Allow` is the intentional standalone default. Under `Deny`, connectivity checks and
 `run_probes` remain available, while Quick, Standard and other full throughput runs return
 `Error::ThroughputDeniedByPeer` before measurements begin. The client does not silently downgrade
 the requested test.

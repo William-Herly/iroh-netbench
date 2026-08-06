@@ -133,8 +133,7 @@ impl NetBenchProtocol {
     fn limits(&self) -> ServerLimits {
         ServerLimits {
             max_test_duration_ms: duration_ms(self.max_test_duration),
-            // Version 1 clients already understand this field. Zero is used as the
-            // backwards-compatible signal that no throughput streams are accepted.
+            // Zero is the protocol-v1 signal that no throughput streams are accepted.
             max_parallel_streams: if self.throughput_policy() == ThroughputPolicy::Allow {
                 self.max_parallel_streams
             } else {

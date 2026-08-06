@@ -15,7 +15,7 @@ rust-version = "1.91"
 [workspace.dependencies]
 bytes = "1.10"
 futures-lite = "2.6"
-iroh = { path = "../iroh/iroh" }
+iroh = { path = "../velinka-iroh/iroh" }
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
