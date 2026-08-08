@@ -5,12 +5,31 @@ Versioning for the Rust crate; wire-protocol and report-schema versions are trac
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-08
+
 ### Changed
 
-- Netbench no longer dials or owns an iroh connection; the host passes an already established
-  `Connection` used by every measurement stream and Datagram.
-- Connection-establishment fields were removed directly while the crate remains pre-1.0. Wire protocol,
-  ALPN and report schema all remain version `1`; no development-only compatibility decoder is retained.
+- The single public crate now lives at the repository root instead of a one-member nested workspace.
+- Netbench no longer dials, registers an ALPN or owns an iroh connection. The host passes an admitted
+  `NetBenchFlow` backed by flow-scoped Stream and Datagram ports.
+- Connection-establishment fields, standalone client/server examples, passive monitoring and internal
+  stream scheduling were removed directly while the crate remains pre-1.0.
+- The Rust crate moves to `0.2.0`. This release directly replaces the `0.1.0` preview; cross-version
+  wire interoperability and report compatibility are unsupported, so wire protocol and report
+  schema remain at their initial value `1`.
+- Responder Datagram echo is scoped to the active test, rejects malformed or unrelated probes,
+  deduplicates sequences and enforces the declared request budget.
+- The unused `sample_interval` setting was removed; throughput progress uses a fixed internal
+  250-millisecond cadence.
+- Live loss progress reports outstanding probes; terminal timeout classification remains in the
+  final `LossReport`.
+
+### Added
+
+- Transport boundary traits for host-owned sessions and reliable Stream halves.
+- Explicit flow-finished acknowledgement so completion does not depend on Connection EOF.
+- Public integration and measurement-semantics documentation plus a complete in-memory host example.
+- Minimal public CI for formatting, clippy, tests, docs, MSRV and package contents.
 
 ## [0.1.0] - 2026-08-02
 
@@ -41,5 +60,6 @@ First preview release of the reusable `iroh-netbench` library.
 - Private Relay-only and Linux netns impaired-path acceptance passed, including `0%`, `0.5%` and
   `2%` packet-loss runs at `12 Mbit/s + 50±10 ms`.
 
-[Unreleased]: https://github.com/William-Herly/iroh-netbench/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/William-Herly/iroh-netbench/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/William-Herly/iroh-netbench/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/William-Herly/iroh-netbench/releases/tag/v0.1.0

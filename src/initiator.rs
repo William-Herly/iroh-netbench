@@ -1,4 +1,4 @@
-//! Client-side benchmark lifecycle.
+//! Initiator-side benchmark lifecycle.
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -9,11 +9,6 @@ use std::{
     time::Duration,
 };
 
-use bytes::Bytes;
-use iroh::{
-    TransportAddr,
-    endpoint::{Connection, PathStats, ReadError, RecvStream, SendStream, VarInt, WriteError},
-};
 use tokio::{
     sync::mpsc,
     task::{AbortHandle, JoinHandle, JoinSet},
@@ -22,38 +17,61 @@ use tokio::{
 
 use crate::{
     Error, FlowInfo, FlowStage, LatencySample, LoadedLatencyReport, LossReport, LossSample,
-    MeasurementPathReport, NetBenchConfig, NetBenchEvent, NetBenchProbeConfig, NetBenchProbeReport,
-    NetBenchReport, PROTOCOL_VERSION, PathKind, Result, SCHEMA_VERSION, SessionMonitor,
+    MeasurementPathReport, NetBenchConfig, NetBenchEvent, NetBenchFlow, NetBenchProbeConfig,
+    NetBenchProbeReport, NetBenchReceiveStream, NetBenchReport, NetBenchSendStream,
+    NetBenchSession, NetBenchTelemetry, PROTOCOL_VERSION, PathKind, Result, SCHEMA_VERSION,
     ThroughputDirection, ThroughputReport, ThroughputSample, TransportReport,
-    scheduling::{
-        THROUGHPUT_CLEANUP_TIMEOUT, deprioritize_throughput_stream, prioritize_control_stream,
-    },
+    config::{LOADED_LATENCY_INTERVAL, MAX_PROBE_RATE_PER_SECOND, THROUGHPUT_SAMPLE_INTERVAL},
     statistics::latency_report,
     wire::{
         Capabilities, ControlMessage, PROBE_MAGIC, Probe, ProbeKind, read_control, write_control,
     },
 };
 
-type ConnectionObserver = Arc<dyn Fn(Connection) + Send + Sync>;
+const THROUGHPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+type SendStream = Box<dyn NetBenchSendStream>;
+type RecvStream = Box<dyn NetBenchReceiveStream>;
 
-// QUIC stream application code used only to mark a normal measurement-window cutoff.
-const MEASUREMENT_COMPLETE_CODE: u32 = 0x4E42;
-
-/// Starts benchmark business flows on a caller-owned iroh connection.
 #[derive(Clone)]
-pub struct NetBenchInitiator {
-    connection_observer: Option<ConnectionObserver>,
+struct Connection(Arc<dyn NetBenchSession>);
+
+impl Connection {
+    fn remote_id(&self) -> String {
+        self.0.remote_peer_id()
+    }
+
+    fn telemetry(&self) -> NetBenchTelemetry {
+        self.0.telemetry()
+    }
+
+    fn max_datagram_size(&self) -> Option<usize> {
+        self.0.max_datagram_size()
+    }
+
+    async fn open_uni(&self) -> Result<SendStream> {
+        Ok(self.0.open_bi().await?.into_split().0)
+    }
+
+    async fn accept_uni(&self) -> Result<RecvStream> {
+        Ok(self.0.accept_bi().await?.into_split().1)
+    }
+
+    async fn send_datagram_wait(&self, bytes: Vec<u8>) -> Result<()> {
+        self.0.send_datagram(bytes).await
+    }
+
+    async fn read_datagram(&self) -> Result<Vec<u8>> {
+        self.0.read_datagram().await
+    }
 }
+
+/// Starts benchmark business flows on a caller-owned authenticated session.
+#[derive(Clone)]
+pub struct NetBenchInitiator;
 
 impl std::fmt::Debug for NetBenchInitiator {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("NetBenchInitiator")
-            .field(
-                "has_connection_observer",
-                &self.connection_observer.is_some(),
-            )
-            .finish()
+        formatter.debug_struct("NetBenchInitiator").finish()
     }
 }
 
@@ -67,24 +85,7 @@ impl NetBenchInitiator {
     /// Creates an initiator which never dials or owns an endpoint/connection lifecycle.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            connection_observer: None,
-        }
-    }
-
-    /// Observes the caller-owned connection when a benchmark flow starts.
-    #[must_use]
-    pub fn on_connection(mut self, observer: impl Fn(Connection) + Send + Sync + 'static) -> Self {
-        self.connection_observer = Some(Arc::new(observer));
-        self
-    }
-
-    /// Registers each supplied benchmark connection with a reusable session monitor.
-    #[must_use]
-    pub fn with_monitor(self, monitor: SessionMonitor) -> Self {
-        self.on_connection(move |connection| {
-            monitor.track("netbench-client", connection);
-        })
+        Self
     }
 
     /// Runs a benchmark and returns only its final result.
@@ -92,12 +93,8 @@ impl NetBenchInitiator {
     /// # Errors
     ///
     /// Returns a negotiation, measurement, timeout, cancellation, or peer error.
-    pub async fn run(
-        &self,
-        connection: Connection,
-        config: NetBenchConfig,
-    ) -> Result<NetBenchReport> {
-        self.start(connection, config).await?.result().await
+    pub async fn run(&self, flow: NetBenchFlow, config: NetBenchConfig) -> Result<NetBenchReport> {
+        self.start(flow, config).await?.result().await
     }
 
     /// Runs only the low-bandwidth latency and loss probes.
@@ -110,19 +107,14 @@ impl NetBenchInitiator {
     /// Returns a connection, negotiation, measurement, or peer error.
     pub async fn run_probes(
         &self,
-        connection: Connection,
+        flow: NetBenchFlow,
         config: NetBenchProbeConfig,
     ) -> Result<NetBenchProbeReport> {
         let (event_tx, _event_rx) = mpsc::channel(128);
         let overall_timeout = config.overall_timeout;
         tokio::time::timeout(
             overall_timeout,
-            run_probe_benchmark(
-                connection,
-                config,
-                &EventSink(event_tx),
-                self.connection_observer.as_ref(),
-            ),
+            run_probe_benchmark(flow, config, &EventSink(event_tx)),
         )
         .await
         .map_err(|_| Error::Timeout {
@@ -139,24 +131,16 @@ impl NetBenchInitiator {
         clippy::unused_async,
         reason = "keeps the documented start(...).await API"
     )]
-    pub async fn start(
-        &self,
-        connection: Connection,
-        config: NetBenchConfig,
-    ) -> Result<NetBenchTest> {
+    pub async fn start(&self, flow: NetBenchFlow, config: NetBenchConfig) -> Result<NetBenchTest> {
         let (event_tx, event_rx) = mpsc::channel(128);
-        let connection_observer = self.connection_observer.clone();
         let events = EventSink(event_tx);
         let overall_timeout = config.overall_timeout;
         let stage = BenchmarkStage::default();
         let task_stage = stage.clone();
         let task = tokio::spawn(async move {
-            if let Some(observer) = connection_observer.as_ref() {
-                observer(connection.clone());
-            }
             let result = if let Ok(result) = tokio::time::timeout(
                 overall_timeout,
-                run_benchmark(connection, config, &events, &task_stage),
+                run_benchmark(flow, config, &events, &task_stage),
             )
             .await
             {
@@ -258,7 +242,7 @@ struct BenchmarkStage(Arc<Mutex<&'static str>>);
 
 impl Default for BenchmarkStage {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new("connection setup")))
+        Self(Arc::new(Mutex::new("flow setup")))
     }
 }
 
@@ -292,20 +276,19 @@ impl EventSink {
     reason = "linear ordering documents the benchmark state machine"
 )]
 async fn run_benchmark(
-    connection: Connection,
+    flow: NetBenchFlow,
     config: NetBenchConfig,
     events: &EventSink,
     stage: &BenchmarkStage,
 ) -> Result<NetBenchReport> {
+    let (session, mut control_send, mut control_recv) = flow.into_parts();
+    let connection = Connection(session);
     let total_started = Instant::now();
     let connect_started = Instant::now();
     let peer_id = connection.remote_id();
 
     stage.set("protocol negotiation");
-    let (mut control_send, mut control_recv) =
-        connection.open_bi().await.map_err(Error::network)?;
-    prioritize_control_stream(&control_send)?;
-    events.send(NetBenchEvent::FlowStage(FlowStage::ControlStreamOpened));
+    events.send(NetBenchEvent::FlowStage(FlowStage::ControlStreamReady));
     write_control(
         &mut control_send,
         &ControlMessage::ClientHello {
@@ -337,11 +320,16 @@ async fn run_benchmark(
         version: selected_version,
     }));
     if !capabilities.datagram_probes {
-        return Err(Error::Protocol(
-            "peer does not support QUIC Datagram probes".to_owned(),
-        ));
+        return finish_with_error(
+            &mut control_send,
+            &mut control_recv,
+            Error::Protocol("peer does not support Datagram probes".to_owned()),
+        )
+        .await;
     }
-    validate_against_server_limits(&config, limits)?;
+    if let Err(error) = validate_against_server_limits(&config, limits) {
+        return finish_with_error(&mut control_send, &mut control_recv, error).await;
+    }
 
     stage.set("path stabilization");
     let path_at_flow_start = selected_path_kind(&connection);
@@ -446,7 +434,7 @@ async fn run_benchmark(
         connection.clone(),
         test_id,
         config.download_duration,
-        Duration::from_millis(200),
+        LOADED_LATENCY_INTERVAL,
         config.probe_timeout,
         ProbeEventMode::Latency(events.clone()),
     );
@@ -463,7 +451,7 @@ async fn run_benchmark(
             let _ = stabilize_path(
                 &connection,
                 config.path_stabilization_timeout,
-                Instant::now(),
+                connect_started,
                 events,
             )
             .await;
@@ -498,7 +486,7 @@ async fn run_benchmark(
         connection.clone(),
         test_id,
         config.upload_duration,
-        Duration::from_millis(200),
+        LOADED_LATENCY_INTERVAL,
         config.probe_timeout,
         ProbeEventMode::Latency(events.clone()),
     );
@@ -524,7 +512,7 @@ async fn run_benchmark(
         upload_increase: upload_p50.saturating_sub(idle_latency.p50),
     };
 
-    control_send.finish().map_err(Error::network)?;
+    finish_flow(&mut control_send, &mut control_recv).await?;
 
     Ok(NetBenchReport {
         schema_version: SCHEMA_VERSION,
@@ -555,22 +543,17 @@ async fn run_benchmark(
     reason = "mirrors the full benchmark negotiation while omitting all throughput phases"
 )]
 async fn run_probe_benchmark(
-    connection: Connection,
+    flow: NetBenchFlow,
     config: NetBenchProbeConfig,
     events: &EventSink,
-    connection_observer: Option<&ConnectionObserver>,
 ) -> Result<NetBenchProbeReport> {
+    let (session, mut control_send, mut control_recv) = flow.into_parts();
+    let connection = Connection(session);
     let total_started = Instant::now();
     let connect_started = Instant::now();
-    if let Some(observer) = connection_observer {
-        observer(connection.clone());
-    }
     let peer_id = connection.remote_id();
 
-    let (mut control_send, mut control_recv) =
-        connection.open_bi().await.map_err(Error::network)?;
-    prioritize_control_stream(&control_send)?;
-    events.send(NetBenchEvent::FlowStage(FlowStage::ControlStreamOpened));
+    events.send(NetBenchEvent::FlowStage(FlowStage::ControlStreamReady));
     write_control(
         &mut control_send,
         &ControlMessage::ClientHello {
@@ -602,11 +585,16 @@ async fn run_probe_benchmark(
         version: selected_version,
     }));
     if !capabilities.datagram_probes {
-        return Err(Error::Protocol(
-            "peer does not support QUIC Datagram probes".to_owned(),
-        ));
+        return finish_with_error(
+            &mut control_send,
+            &mut control_recv,
+            Error::Protocol("peer does not support Datagram probes".to_owned()),
+        )
+        .await;
     }
-    validate_probes_against_server_limits(&config, limits)?;
+    if let Err(error) = validate_probes_against_server_limits(&config, limits) {
+        return finish_with_error(&mut control_send, &mut control_recv, error).await;
+    }
 
     let path_at_flow_start = selected_path_kind(&connection);
     let (initial_path, stabilization_time_to_direct) = stabilize_path(
@@ -682,7 +670,7 @@ async fn run_probe_benchmark(
     } else {
         None
     };
-    control_send.finish().map_err(Error::network)?;
+    finish_flow(&mut control_send, &mut control_recv).await?;
 
     Ok(NetBenchProbeReport {
         schema_version: SCHEMA_VERSION,
@@ -709,10 +697,31 @@ fn validate_against_server_limits(
     config: &NetBenchConfig,
     limits: crate::wire::ServerLimits,
 ) -> Result<()> {
-    if limits.max_parallel_streams == 0 {
+    validate_probe_parameters(
+        config.latency_duration,
+        config.latency_interval,
+        config.loss_duration,
+        config.loss_rate_per_second,
+    )?;
+    if limits.parallel_streams == 0 {
         return Err(Error::ThroughputDeniedByPeer);
     }
-    let maximum = Duration::from_millis(u64::from(limits.max_test_duration_ms));
+    if config.parallel_streams == 0 {
+        return Err(Error::Protocol(
+            "parallel stream count must be greater than zero".to_owned(),
+        ));
+    }
+    if config.chunk_size == 0 {
+        return Err(Error::Protocol(
+            "throughput chunk size must be greater than zero".to_owned(),
+        ));
+    }
+    if duration_ms(config.download_duration) == 0 || duration_ms(config.upload_duration) == 0 {
+        return Err(Error::Protocol(
+            "throughput durations must be at least one millisecond".to_owned(),
+        ));
+    }
+    let maximum = Duration::from_millis(u64::from(limits.test_duration_ms));
     for duration in [
         config.latency_duration,
         config.loss_duration,
@@ -721,6 +730,11 @@ fn validate_against_server_limits(
         config.download_warmup,
         config.upload_warmup,
     ] {
+        if !duration.is_zero() && duration_ms(duration) == 0 {
+            return Err(Error::Protocol(
+                "phase durations must be zero or at least one millisecond".to_owned(),
+            ));
+        }
         if duration > maximum {
             return Err(Error::DurationLimitExceeded {
                 requested: duration,
@@ -728,16 +742,16 @@ fn validate_against_server_limits(
             });
         }
     }
-    if config.parallel_streams > limits.max_parallel_streams {
+    if config.parallel_streams > limits.parallel_streams {
         return Err(Error::Protocol(format!(
             "requested {} streams but server allows {}",
-            config.parallel_streams, limits.max_parallel_streams
+            config.parallel_streams, limits.parallel_streams
         )));
     }
-    if config.chunk_size > limits.max_chunk_size {
+    if config.chunk_size > limits.chunk_size {
         return Err(Error::Protocol(format!(
             "requested {} byte chunks but server allows {}",
-            config.chunk_size, limits.max_chunk_size
+            config.chunk_size, limits.chunk_size
         )));
     }
     Ok(())
@@ -747,7 +761,13 @@ fn validate_probes_against_server_limits(
     config: &NetBenchProbeConfig,
     limits: crate::wire::ServerLimits,
 ) -> Result<()> {
-    let maximum = Duration::from_millis(u64::from(limits.max_test_duration_ms));
+    validate_probe_parameters(
+        config.latency_duration,
+        config.latency_interval,
+        config.loss_duration,
+        config.loss_rate_per_second,
+    )?;
+    let maximum = Duration::from_millis(u64::from(limits.test_duration_ms));
     for duration in [config.latency_duration, config.loss_duration] {
         if duration > maximum {
             return Err(Error::DurationLimitExceeded {
@@ -757,6 +777,39 @@ fn validate_probes_against_server_limits(
         }
     }
     Ok(())
+}
+
+fn validate_probe_parameters(
+    latency_duration: Duration,
+    latency_interval: Duration,
+    loss_duration: Duration,
+    loss_rate_per_second: u32,
+) -> Result<()> {
+    if duration_ms(latency_duration) == 0 || duration_ms(loss_duration) == 0 {
+        return Err(Error::Protocol(
+            "probe durations must be at least one millisecond".to_owned(),
+        ));
+    }
+    if duration_ms(latency_interval) == 0 {
+        return Err(Error::Protocol(
+            "latency probe interval must be at least one millisecond".to_owned(),
+        ));
+    }
+    if !(1..=MAX_PROBE_RATE_PER_SECOND).contains(&loss_rate_per_second) {
+        return Err(Error::Protocol(format!(
+            "loss probe rate must be within 1..={MAX_PROBE_RATE_PER_SECOND} per second"
+        )));
+    }
+    Ok(())
+}
+
+async fn finish_with_error<T>(
+    send: &mut SendStream,
+    recv: &mut RecvStream,
+    error: Error,
+) -> Result<T> {
+    finish_flow(send, recv).await?;
+    Err(error)
 }
 
 fn peer_or_protocol_error(message: ControlMessage) -> Error {
@@ -888,7 +941,7 @@ async fn measure_probes(
                 let payload = postcard::to_allocvec(&probe)?;
                 match tokio::time::timeout_at(
                     send_deadline,
-                    connection.send_datagram_wait(Bytes::from(payload)),
+                    connection.send_datagram_wait(payload),
                 )
                 .await
                 {
@@ -927,7 +980,7 @@ async fn measure_probes(
                         LossSample {
                             sent: sequence,
                             received: received.len() as u64,
-                            timed_out: sequence.saturating_sub(received.len() as u64),
+                            outstanding: sequence.saturating_sub(received.len() as u64),
                         }
                     )),
                 }
@@ -974,12 +1027,9 @@ async fn download_phase(
     let total = Arc::new(AtomicU64::new(0));
     let mut download_streams = Vec::with_capacity(usize::from(streams));
     for _ in 0..streams {
-        let mut stream = connection.accept_uni().await.map_err(Error::network)?;
+        let mut stream = connection.accept_uni().await?;
         let mut magic = [0_u8; 1];
-        stream
-            .read_exact(&mut magic)
-            .await
-            .map_err(Error::network)?;
+        stream.read_exact(&mut magic).await?;
         if magic[0] != 0x44 {
             return Err(Error::Protocol(
                 "download stream has an invalid pre-measurement header".to_owned(),
@@ -1005,17 +1055,14 @@ async fn download_phase(
             let mut buffer = vec![0_u8; 64 * 1024];
             while Instant::now() < deadline {
                 match tokio::time::timeout_at(deadline, stream.read(&mut buffer)).await {
-                    Ok(Ok(Some(read))) if Instant::now() <= deadline => {
+                    Ok(Ok(read)) if read > 0 && Instant::now() <= deadline => {
                         total.fetch_add(read as u64, Ordering::Relaxed);
                     }
-                    Ok(Ok(Some(_) | None)) | Err(_) => break,
-                    Ok(Err(ReadError::Reset(code))) if code == measurement_complete_code() => {
-                        break;
-                    }
-                    Ok(Err(error)) => return Err(Error::network(error)),
+                    Ok(Ok(_)) | Err(_) => break,
+                    Ok(Err(error)) => return Err(error),
                 }
             }
-            let _ = stream.stop(measurement_complete_code());
+            stream.cancel();
             Result::<()>::Ok(())
         });
     }
@@ -1071,9 +1118,8 @@ async fn upload_phase(
 
     let mut upload_streams = Vec::with_capacity(usize::from(streams));
     for _ in 0..streams {
-        let mut stream = connection.open_uni().await.map_err(Error::network)?;
-        deprioritize_throughput_stream(&stream)?;
-        stream.write_all(&[0x55]).await.map_err(Error::network)?;
+        let mut stream = connection.open_uni().await?;
+        stream.write_all(&[0x55]).await?;
         upload_streams.push(stream);
     }
     expect_ready(control_recv, test_id).await?;
@@ -1091,14 +1137,11 @@ async fn upload_phase(
             while Instant::now() < deadline {
                 match tokio::time::timeout_at(deadline, stream.write(&chunk)).await {
                     Ok(Ok(_)) => {}
-                    Ok(Err(WriteError::Stopped(code))) if code == measurement_complete_code() => {
-                        break;
-                    }
-                    Ok(Err(error)) => return Err(Error::network(error)),
-                    Err(_) => break,
+                    Ok(Err(Error::FlowStopped)) | Err(_) => break,
+                    Ok(Err(error)) => return Err(error),
                 }
             }
-            let _ = stream.reset(measurement_complete_code());
+            stream.cancel();
             Result::<()>::Ok(())
         });
     }
@@ -1206,7 +1249,7 @@ fn spawn_sampler(
             return;
         };
         let mut samples = VecDeque::<(Instant, u64)>::from([(started, 0)]);
-        let mut ticker = tokio::time::interval(Duration::from_millis(250));
+        let mut ticker = tokio::time::interval(THROUGHPUT_SAMPLE_INTERVAL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         ticker.tick().await;
         loop {
@@ -1260,10 +1303,7 @@ fn spawn_path_monitor(
         let mut previous = selected_path_kind(&connection);
         let mut ticker = tokio::time::interval(Duration::from_millis(250));
         loop {
-            tokio::select! {
-                _ = ticker.tick() => {}
-                _ = connection.closed() => break,
-            }
+            ticker.tick().await;
             let current = selected_path_kind(&connection);
             if current != previous {
                 let mut state = lock_unpoisoned(&task_state);
@@ -1329,6 +1369,23 @@ async fn expect_finished(recv: &mut RecvStream, expected_test_id: u64) -> Result
     }
 }
 
+async fn finish_flow(send: &mut SendStream, recv: &mut RecvStream) -> Result<()> {
+    write_control(send, &ControlMessage::FlowFinished).await?;
+    match read_control(recv).await? {
+        ControlMessage::FlowFinishedAck => {
+            send.finish().map_err(Error::network)?;
+            Ok(())
+        }
+        ControlMessage::Error { code, message } => Err(Error::Peer {
+            code: code as u16,
+            message,
+        }),
+        other => Err(Error::Protocol(format!(
+            "expected FlowFinishedAck, received {other:?}"
+        ))),
+    }
+}
+
 #[allow(
     clippy::cast_precision_loss,
     reason = "throughput is intentionally reported as f64"
@@ -1347,22 +1404,7 @@ fn throughput_report(bytes: u64, duration: Duration, streams: u16) -> Throughput
 }
 
 fn selected_path_kind(connection: &Connection) -> PathKind {
-    let paths = connection.paths();
-    let selected = paths.iter().find(iroh::endpoint::Path::is_selected);
-    let Some(path) = selected else {
-        return PathKind::Unknown;
-    };
-    match path.remote_addr() {
-        TransportAddr::Relay(_) => PathKind::Relay,
-        TransportAddr::Ip(address) if address.is_ipv4() => PathKind::DirectIpv4,
-        TransportAddr::Ip(address) if address.is_ipv6() => PathKind::DirectIpv6,
-        TransportAddr::Ip(_) => PathKind::Direct,
-        _ => PathKind::Unknown,
-    }
-}
-
-fn measurement_complete_code() -> VarInt {
-    MEASUREMENT_COMPLETE_CODE.into()
+    connection.telemetry().path
 }
 
 #[derive(Clone, Copy, Default)]
@@ -1379,21 +1421,16 @@ struct TransportSnapshot {
 
 impl TransportSnapshot {
     fn capture(connection: &Connection) -> Self {
-        let stats = connection.stats();
-        let selected: Option<PathStats> = connection
-            .paths()
-            .iter()
-            .find(iroh::endpoint::Path::is_selected)
-            .map(|path| path.stats());
+        let telemetry = connection.telemetry();
         Self {
-            connection_lost_packets: stats.lost_packets,
-            connection_lost_bytes: stats.lost_bytes,
-            udp_rx_datagrams: stats.udp_rx.datagrams,
-            udp_tx_datagrams: stats.udp_tx.datagrams,
-            congestion_events: selected.map_or(0, |path| path.congestion_events),
-            black_holes_detected: selected.map_or(0, |path| path.black_holes_detected),
-            current_mtu: selected.map_or(0, |path| path.current_mtu),
-            rtt: selected.map_or(Duration::ZERO, |path| path.rtt),
+            connection_lost_packets: telemetry.lost_packets,
+            connection_lost_bytes: telemetry.lost_bytes,
+            udp_rx_datagrams: telemetry.rx_datagrams,
+            udp_tx_datagrams: telemetry.tx_datagrams,
+            congestion_events: telemetry.congestion_events,
+            black_holes_detected: telemetry.black_holes_detected,
+            current_mtu: telemetry.current_mtu,
+            rtt: telemetry.rtt,
         }
     }
 

@@ -1,31 +1,33 @@
-[workspace]
-resolver = "2"
-members = [
-    "crates/iroh-netbench",
-]
-default-members = ["crates/iroh-netbench"]
-
-[workspace.package]
-version = "0.1.0"
+[package]
+name = "iroh-netbench"
+description = "Application-level network benchmarking inside a caller-owned peer session"
+version = "0.2.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.91"
+readme = "README.md"
+repository = "https://github.com/William-Herly/iroh-netbench"
+documentation = "https://docs.rs/iroh-netbench"
+keywords = ["iroh", "quic", "network", "benchmark", "diagnostics"]
+categories = ["network-programming", "asynchronous"]
+publish = ["crates-io"]
+exclude = ["/.github/**", "/.gitignore", "/Cargo.lock"]
 
-[workspace.dependencies]
-bytes = "1.10"
-futures-lite = "2.6"
-iroh = { path = "../velinka-iroh/iroh" }
+[dependencies]
+async-trait = "0.1"
 postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
 thiserror = "2.0"
-tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.47", default-features = false, features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"
 
-[workspace.lints.rust]
+[dev-dependencies]
+tokio = { version = "1.47", default-features = false, features = ["io-util", "rt-multi-thread"] }
+
+[lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"
 
-[workspace.lints.clippy]
+[lints.clippy]
 all = "warn"
 pedantic = "warn"

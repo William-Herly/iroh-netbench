@@ -1,38 +1,40 @@
-//! Client benchmark configuration and presets.
+//! Benchmark configuration and presets.
 
 use std::time::Duration;
+
+pub(crate) const LOADED_LATENCY_INTERVAL: Duration = Duration::from_millis(200);
+pub(crate) const THROUGHPUT_SAMPLE_INTERVAL: Duration = Duration::from_millis(250);
+pub(crate) const MAX_PROBE_RATE_PER_SECOND: u32 = 1_000;
 
 /// Parameters for one complete benchmark run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetBenchConfig {
-    /// Hard wall-clock limit for the complete benchmark, including connection setup and cleanup.
+    /// Hard wall-clock limit for the complete benchmark flow, including negotiation and cleanup.
     pub overall_timeout: Duration,
     /// Maximum time to wait for a direct path before measurements begin.
     pub path_stabilization_timeout: Duration,
-    /// Idle RTT measurement duration.
+    /// Idle RTT measurement duration, at least one millisecond.
     pub latency_duration: Duration,
-    /// Delay between idle RTT probes.
+    /// Delay between idle RTT probes, at least one millisecond.
     pub latency_interval: Duration,
-    /// Datagram timeout measurement duration.
+    /// Datagram timeout measurement duration, at least one millisecond.
     pub loss_duration: Duration,
-    /// Number of datagram probes sent per second.
+    /// Number of Datagram probes sent per second, within `1..=1000`.
     pub loss_rate_per_second: u32,
     /// Time after the last probe before outstanding probes time out.
     pub probe_timeout: Duration,
     /// Warm-up before download accounting starts.
     pub download_warmup: Duration,
-    /// Accounted download duration.
+    /// Accounted download duration, at least one millisecond.
     pub download_duration: Duration,
     /// Warm-up before upload accounting starts.
     pub upload_warmup: Duration,
-    /// Accounted upload duration.
+    /// Accounted upload duration, at least one millisecond.
     pub upload_duration: Duration,
-    /// Number of parallel unidirectional streams per throughput direction.
+    /// Non-zero parallel unidirectional stream count per throughput direction.
     pub parallel_streams: u16,
-    /// Payload size written at a time.
+    /// Non-zero payload size written at a time.
     pub chunk_size: u32,
-    /// Interval between progress samples.
-    pub sample_interval: Duration,
 }
 
 /// Parameters for a low-bandwidth latency and loss probe run.
@@ -45,13 +47,13 @@ pub struct NetBenchProbeConfig {
     pub overall_timeout: Duration,
     /// Maximum time to wait for a direct path before measurements begin.
     pub path_stabilization_timeout: Duration,
-    /// Idle RTT measurement duration.
+    /// Idle RTT measurement duration, at least one millisecond.
     pub latency_duration: Duration,
-    /// Delay between idle RTT probes.
+    /// Delay between idle RTT probes, at least one millisecond.
     pub latency_interval: Duration,
-    /// Datagram timeout measurement duration.
+    /// Datagram timeout measurement duration, at least one millisecond.
     pub loss_duration: Duration,
-    /// Number of datagram probes sent per second.
+    /// Number of Datagram probes sent per second, within `1..=1000`.
     pub loss_rate_per_second: u32,
     /// Time after the last probe before outstanding probes time out.
     pub probe_timeout: Duration,
@@ -75,7 +77,6 @@ impl NetBenchConfig {
             upload_duration: Duration::from_secs(5),
             parallel_streams: 4,
             chunk_size: 64 * 1024,
-            sample_interval: Duration::from_millis(250),
         }
     }
 

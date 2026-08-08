@@ -1,37 +1,33 @@
-//! Network quality measurements over a dedicated iroh QUIC connection.
+//! Network quality measurements inside a caller-owned authenticated peer session.
 //!
 //! This crate is intentionally independent from file transfer and diagnostics.
 
-mod client;
 mod config;
 mod error;
 mod event;
-mod monitor;
-mod protocol;
+mod flow;
+mod initiator;
 mod report;
-mod scheduling;
+mod responder;
 mod statistics;
-pub mod wire;
+mod wire;
 
-pub use client::{NetBenchInitiator, NetBenchTest};
 pub use config::{NetBenchConfig, NetBenchProbeConfig};
 pub use error::{Error, Result};
 pub use event::{
     FlowInfo, FlowStage, LatencySample, LossSample, NetBenchEvent, ThroughputDirection,
     ThroughputSample,
 };
-pub use monitor::{
-    ConnectionMetrics, MonitoredConnectionId, MonitoredConnectionState, SessionMetrics,
-    SessionMonitor, SessionMonitorConfig,
+pub use flow::{
+    NetBenchBidirectionalStream, NetBenchFlow, NetBenchReceiveStream, NetBenchSendStream,
+    NetBenchSession, NetBenchTelemetry,
 };
-pub use protocol::{NetBenchProtocol, NetBenchProtocolBuilder, ThroughputPolicy};
+pub use initiator::{NetBenchInitiator, NetBenchTest};
 pub use report::{
     LatencyReport, LoadedLatencyReport, LossReport, MeasurementPathReport, NetBenchProbeReport,
     NetBenchReport, PathKind, ThroughputReport, TransportReport,
 };
-
-/// ALPN used by the benchmark protocol.
-pub const NETBENCH_ALPN: &[u8] = b"/iroh/netbench/1";
+pub use responder::{NetBenchResponder, NetBenchResponderBuilder, ThroughputPolicy};
 
 /// Current wire protocol version.
 ///

@@ -17,11 +17,11 @@ pub struct Capabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServerLimits {
     /// Maximum duration of an individual test phase.
-    pub max_test_duration_ms: u32,
+    pub test_duration_ms: u32,
     /// Maximum unidirectional stream count per throughput phase.
-    pub max_parallel_streams: u16,
+    pub parallel_streams: u16,
     /// Maximum throughput chunk size.
-    pub max_chunk_size: u32,
+    pub chunk_size: u32,
 }
 
 /// Stable peer-visible error category.
@@ -129,6 +129,10 @@ pub enum ControlMessage {
         /// Receiver measurement duration.
         duration_ns: u64,
     },
+    /// The initiator has completed every requested phase and consumed all terminal responses.
+    FlowFinished,
+    /// The responder confirms clean flow completion; neither side needs peer-session EOF.
+    FlowFinishedAck,
     /// Structured protocol failure.
     Error {
         /// Stable machine-readable category.

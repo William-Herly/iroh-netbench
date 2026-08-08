@@ -54,20 +54,17 @@ pub enum Error {
         message: String,
     },
 
-    /// An iroh connection or stream operation failed.
+    /// A host session or stream operation failed.
     #[error("network error: {0}")]
     Network(String),
+
+    /// The peer cleanly ended a flow-local measurement stream at its accounting deadline.
+    #[error("measurement stream was stopped by the peer")]
+    FlowStopped,
 
     /// A protocol invariant was violated.
     #[error("protocol error: {0}")]
     Protocol(String),
-
-    /// The operation belongs to a later implementation phase.
-    #[error("{feature} is not implemented yet")]
-    NotImplemented {
-        /// Missing feature name.
-        feature: &'static str,
-    },
 
     /// Control message serialization failed.
     #[error("control codec error: {0}")]

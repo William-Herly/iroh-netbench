@@ -2,7 +2,6 @@
 
 use std::time::Duration;
 
-use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
 /// High-level path classification over the lifetime of a run.
@@ -135,8 +134,8 @@ pub struct NetBenchReport {
     pub schema_version: u16,
     /// Negotiated wire protocol version.
     pub protocol_version: u16,
-    /// Remote endpoint identity.
-    pub peer_id: EndpointId,
+    /// Remote peer identity.
+    pub peer_id: String,
     /// Wall-clock duration of the run.
     pub total_duration: Duration,
     /// Path details observed during the benchmark flow.
@@ -162,8 +161,8 @@ pub struct NetBenchProbeReport {
     pub schema_version: u16,
     /// Negotiated wire protocol version.
     pub protocol_version: u16,
-    /// Remote endpoint identity.
-    pub peer_id: EndpointId,
+    /// Remote peer identity.
+    pub peer_id: String,
     /// Wall-clock duration of the run.
     pub total_duration: Duration,
     /// Path details observed during the probe flow.

@@ -1,7 +1,6 @@
 //! Length-prefixed postcard control framing.
 
-use crate::{Error, Result};
-use iroh::endpoint::{RecvStream, SendStream};
+use crate::{Error, NetBenchReceiveStream, NetBenchSendStream, Result};
 
 use super::ControlMessage;
 
@@ -40,7 +39,8 @@ pub fn encode_control(message: &ControlMessage) -> Result<Vec<u8>> {
 /// Returns an I/O error for an incomplete or inconsistent frame,
 /// [`crate::Error::ControlMessageTooLarge`] for an oversized declaration,
 /// or [`crate::Error::Codec`] when postcard cannot decode the payload.
-pub fn decode_control(frame: &[u8]) -> Result<ControlMessage> {
+#[cfg(test)]
+fn decode_control(frame: &[u8]) -> Result<ControlMessage> {
     if frame.len() < 4 {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -72,24 +72,27 @@ pub fn decode_control(frame: &[u8]) -> Result<ControlMessage> {
     Ok(postcard::from_bytes(&frame[4..])?)
 }
 
-/// Writes one length-prefixed message to an iroh control stream.
+/// Writes one length-prefixed message to a host-routed control stream.
 ///
 /// # Errors
 ///
-/// Returns a codec, size-limit, or QUIC stream error.
-pub async fn write_control(send: &mut SendStream, message: &ControlMessage) -> Result<()> {
+/// Returns a codec, size-limit, or host stream error.
+pub async fn write_control(
+    send: &mut dyn NetBenchSendStream,
+    message: &ControlMessage,
+) -> Result<()> {
     let frame = encode_control(message)?;
-    send.write_all(&frame).await.map_err(Error::network)
+    send.write_all(&frame).await
 }
 
-/// Reads one length-prefixed message from an iroh control stream.
+/// Reads one length-prefixed message from a host-routed control stream.
 ///
 /// # Errors
 ///
-/// Returns a size-limit, codec, unexpected EOF, or QUIC stream error.
-pub async fn read_control(recv: &mut RecvStream) -> Result<ControlMessage> {
+/// Returns a size-limit, codec, unexpected EOF, or host stream error.
+pub async fn read_control(recv: &mut dyn NetBenchReceiveStream) -> Result<ControlMessage> {
     let mut length = [0_u8; 4];
-    recv.read_exact(&mut length).await.map_err(Error::network)?;
+    recv.read_exact(&mut length).await?;
     let declared = u32::from_be_bytes(length) as usize;
     if declared > MAX_CONTROL_MESSAGE_SIZE {
         return Err(Error::ControlMessageTooLarge {
@@ -98,9 +101,7 @@ pub async fn read_control(recv: &mut RecvStream) -> Result<ControlMessage> {
         });
     }
     let mut payload = vec![0_u8; declared];
-    recv.read_exact(&mut payload)
-        .await
-        .map_err(Error::network)?;
+    recv.read_exact(&mut payload).await?;
     Ok(postcard::from_bytes(&payload)?)
 }
 

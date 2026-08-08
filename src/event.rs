@@ -9,8 +9,8 @@ use crate::{NetBenchReport, PathKind};
 /// Fine-grained benchmark-flow negotiation and path progress.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FlowStage {
-    /// The reliable bidirectional control stream was opened.
-    ControlStreamOpened,
+    /// The host-routed reliable bidirectional control stream became active.
+    ControlStreamReady,
     /// Client versions and capabilities were sent.
     ClientHelloSent,
     /// The server selected a compatible version.
@@ -60,8 +60,8 @@ pub struct LossSample {
     pub sent: u64,
     /// Echoes received so far.
     pub received: u64,
-    /// Probes currently classified as timed out.
-    pub timed_out: u64,
+    /// Sent probes which have not yet produced a unique echo.
+    pub outstanding: u64,
 }
 
 /// Throughput traffic direction.
