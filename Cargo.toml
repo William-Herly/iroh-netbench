@@ -3,7 +3,6 @@ resolver = "2"
 members = [
     "crates/iroh-netbench",
 ]
-exclude = ["crates/transfer-demo"]
 default-members = ["crates/iroh-netbench"]
 
 [workspace.package]

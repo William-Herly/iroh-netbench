@@ -21,7 +21,7 @@ async fn connect(endpoint: &Endpoint, peer: EndpointAddr) -> iroh::endpoint::Con
 fn public_protocol_identity_is_stable() {
     assert_eq!(NETBENCH_ALPN, b"/iroh/netbench/1");
     assert_eq!(PROTOCOL_VERSION, 1);
-    assert_eq!(SCHEMA_VERSION, 2);
+    assert_eq!(SCHEMA_VERSION, 1);
     assert_eq!(NetBenchProtocol::default().max_parallel_streams(), 8);
     assert_eq!(
         NetBenchProtocol::default().throughput_policy(),

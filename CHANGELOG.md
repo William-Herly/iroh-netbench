@@ -9,8 +9,8 @@ Versioning for the Rust crate; wire-protocol and report-schema versions are trac
 
 - Netbench no longer dials or owns an iroh connection; the host passes an already established
   `Connection` used by every measurement stream and Datagram.
-- Report schema is now version `2` because connection-establishment fields were removed. Wire
-  protocol and ALPN remain version `1`.
+- Connection-establishment fields were removed directly while the crate remains pre-1.0. Wire protocol,
+  ALPN and report schema all remain version `1`; no development-only compatibility decoder is retained.
 
 ## [0.1.0] - 2026-08-02
 
@@ -38,7 +38,6 @@ First preview release of the reusable `iroh-netbench` library.
 ### Release scope
 
 - `iroh-netbench` is the only public crate.
-- `transfer-demo` remains an internal test application and is not a public release artifact.
 - Private Relay-only and Linux netns impaired-path acceptance passed, including `0%`, `0.5%` and
   `2%` packet-loss runs at `12 Mbit/s + 50±10 ms`.
 

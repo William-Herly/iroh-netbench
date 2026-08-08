@@ -11,14 +11,19 @@ A small embeddable Rust component for benchmarking and monitoring
 `iroh-netbench` runs benchmark business flows on a host-established iroh `Connection`. It does not
 own an `Endpoint`, resolve peer addresses, dial, choose a path policy, or close the connection.
 
-> Status: the maintained branch uses wire protocol v1 and report schema v2. The reusable library passed its
+> Status: the maintained branch uses wire protocol v1 and report schema v1. The reusable library passed its
 > Direct, Relay and impaired-path acceptance matrix. Rust APIs may still evolve while the crate
 > remains below `1.0`.
 
 ## Release scope
 
-The buildable workspace contains only the `iroh-netbench` library crate. The legacy
-`transfer-demo` is excluded from the workspace and does not define or validate the new API.
+The build and release surface contains only the `iroh-netbench` library crate; no demo application
+is a release artifact.
+
+The source still exposes a standalone `NETBENCH_ALPN` responder entry point. Velinka's target
+integration will replace that responder with its host PeerSession business-flow dispatcher and
+remove the standalone entry point without a compatibility layer. Until then, it is not the final
+1.0 API.
 
 The library does not create or own Relay, discovery, PKARR or certificate infrastructure. The host
 application supplies a configured `Endpoint` and decides which peer addresses and paths are
@@ -267,7 +272,7 @@ Passive monitoring and active benchmarking use different counters:
 | Value | Meaning |
 |---|---|
 | `SessionMetrics` / `ConnectionMetrics` throughput | Wire-level UDP byte deltas, including QUIC overhead |
-| `ConnectionMetrics.rtt` | QUIC transport RTT from the selected path |
+| `ConnectionMetrics.rtt` | Smoothed QUIC transport RTT for the selected path, not the latest application-interaction RTT |
 | `ConnectionMetrics.recent_loss_ratio` | Recent QUIC-declared loss |
 | `NetBenchReport.download` | Client-received application payload |
 | `NetBenchReport.upload` | Server-received application payload |
@@ -309,7 +314,7 @@ The examples disable Relay and are intended for local/direct testing.
 - Rust 1.91 or newer
 - ALPN: `/iroh/netbench/1`
 - wire protocol: `1`
-- report schema: `2`
+- report schema: `1`
 
 The wire version increases only for incompatible changes to network messages or their semantics.
 Local Rust API, UI and passive-monitoring changes do not bump it.

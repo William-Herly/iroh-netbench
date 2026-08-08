@@ -11,13 +11,16 @@
 `iroh-netbench` 只在宿主已经建立好的 iroh `Connection` 内运行测速业务流。它不持有
 `Endpoint`、不解析对端地址、不拨号、不选择建联策略，也不关闭整条 Connection。
 
-> 当前维护分支使用线协议 v1、报告 schema v2。可复用库已经通过 Direct、Relay 和受损
+> 当前维护分支使用线协议 v1、报告 schema v1。可复用库已经通过 Direct、Relay 和受损
 > 链路验收矩阵；在 crate 达到 `1.0` 前，Rust API 仍可能调整。
 
 ## 发布范围
 
-可构建 workspace 只包含 `iroh-netbench` 库 crate。旧 `transfer-demo` 已从 workspace 移出，
-不发布、不参与新 API 验证；其源码仅作历史参考。
+可构建和发布范围只包含 `iroh-netbench` 库 crate，不提供 demo 应用产物。
+
+当前源码仍保留独立 `NETBENCH_ALPN` responder 入口；Velinka 的目标集成会把 responder 也改成
+宿主 PeerSession 内的 business-flow dispatcher，并直接删除该入口，不提供兼容层。完成前以
+Velinka 的实施计划为准，不能把独立 ALPN 当成最终 1.0 API。
 
 库本身不创建或持有 Relay、Discovery、PKARR 或证书基础设施。宿主应用负责提供已配置的
 `Endpoint`，并决定哪些对端地址和路径允许进行完整吞吐测速。
@@ -131,7 +134,7 @@ payload。
 完整测速任务可以显式取消并等待退出：
 
 ```rust,ignore
-let test = client.start(peer_addr, NetBenchConfig::quick()).await?;
+let test = client.start(connection.clone(), NetBenchConfig::quick()).await?;
 
 // 用户取消或外层操作结束时调用。
 test.cancel();
@@ -260,7 +263,7 @@ monitor 不持有连接生命周期，不发送心跳，也不会主动产生测
 | 数据 | 含义 |
 |---|---|
 | `SessionMetrics` / `ConnectionMetrics` 速率 | UDP wire-level 字节差值，包含 QUIC 开销 |
-| `ConnectionMetrics.rtt` | 当前路径的 QUIC 传输层 RTT |
+| `ConnectionMetrics.rtt` | 当前路径的 QUIC 平滑传输 RTT；不是最新应用交互延迟 |
 | `ConnectionMetrics.recent_loss_ratio` | QUIC 近期判定的丢包 |
 | `NetBenchReport.download` | 客户端收到的应用 payload |
 | `NetBenchReport.upload` | 服务端收到的应用 payload |
@@ -300,7 +303,7 @@ cargo run --example netbench-client -- '<服务端输出的 EndpointAddr JSON>'
 - Rust 1.91+
 - ALPN：`/iroh/netbench/1`
 - 线协议：`1`
-- 报告 schema：`2`
+- 报告 schema：`1`
 
 线协议版本只在网络报文或语义发生不兼容变更时递增；本地 Rust API、UI 和被动监控
 调整不会推动该版本增长。

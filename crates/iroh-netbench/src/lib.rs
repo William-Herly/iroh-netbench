@@ -40,6 +40,6 @@ pub const PROTOCOL_VERSION: u16 = 1;
 
 /// Current JSON/report schema version.
 ///
-/// Version 2 removes connection-establishment fields: netbench now reports only the business-flow
-/// measurement window of a caller-owned connection.
-pub const SCHEMA_VERSION: u16 = 2;
+/// While the crate is pre-1.0, report-shape changes replace the initial schema directly rather
+/// than retaining development-only schema versions or compatibility decoders.
+pub const SCHEMA_VERSION: u16 = 1;

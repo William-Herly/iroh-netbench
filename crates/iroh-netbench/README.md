@@ -3,8 +3,12 @@
 Embeddable latency, Datagram timeout, throughput and transport diagnostics for
 [iroh](https://github.com/n0-computer/iroh) QUIC connections.
 
-> The maintained branch uses wire protocol version `1` and report schema version `2`;
+> The maintained branch uses wire protocol version `1` and report schema version `1`;
 > Rust APIs may still evolve while the crate remains below `1.0`.
+
+The standalone `NETBENCH_ALPN` responder shown below is a pre-1.0 integration point. Velinka will
+replace it with its host PeerSession business-flow dispatcher and remove this entry point directly;
+it is not a compatibility promise.
 
 The responder mounts `NetBenchProtocol` on its Router. The host establishes an iroh `Connection`
 and passes that same connection to `NetBenchInitiator`; netbench never dials or owns its lifecycle.
