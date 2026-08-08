@@ -5,6 +5,13 @@ Versioning for the Rust crate; wire-protocol and report-schema versions are trac
 
 ## [Unreleased]
 
+### Changed
+
+- Netbench no longer dials or owns an iroh connection; the host passes an already established
+  `Connection` used by every measurement stream and Datagram.
+- Report schema is now version `2` because connection-establishment fields were removed. Wire
+  protocol and ALPN remain version `1`.
+
 ## [0.1.0] - 2026-08-02
 
 First preview release of the reusable `iroh-netbench` library.

@@ -309,7 +309,7 @@ The examples disable Relay and are intended for local/direct testing.
 - Rust 1.91 or newer
 - ALPN: `/iroh/netbench/1`
 - wire protocol: `1`
-- report schema: `1`
+- report schema: `2`
 
 The wire version increases only for incompatible changes to network messages or their semantics.
 Local Rust API, UI and passive-monitoring changes do not bump it.

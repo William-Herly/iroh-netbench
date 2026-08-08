@@ -300,7 +300,7 @@ cargo run --example netbench-client -- '<服务端输出的 EndpointAddr JSON>'
 - Rust 1.91+
 - ALPN：`/iroh/netbench/1`
 - 线协议：`1`
-- 报告 schema：`1`
+- 报告 schema：`2`
 
 线协议版本只在网络报文或语义发生不兼容变更时递增；本地 Rust API、UI 和被动监控
 调整不会推动该版本增长。
