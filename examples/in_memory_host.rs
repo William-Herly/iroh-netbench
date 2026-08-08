@@ -19,6 +19,7 @@ struct MemorySession {
     stream_rx: Mutex<mpsc::Receiver<DuplexStream>>,
     datagram_tx: mpsc::Sender<Vec<u8>>,
     datagram_rx: Mutex<mpsc::Receiver<Vec<u8>>>,
+    drop_outbound_datagrams: bool,
 }
 
 #[async_trait]
@@ -60,6 +61,9 @@ impl NetBenchSession for MemorySession {
     }
 
     async fn send_datagram(&self, bytes: Vec<u8>) -> Result<()> {
+        if self.drop_outbound_datagrams {
+            return Ok(());
+        }
         self.datagram_tx
             .send(bytes)
             .await
@@ -160,6 +164,12 @@ impl NetBenchReceiveStream for MemoryReceive {
 }
 
 fn session_pair() -> (Arc<MemorySession>, Arc<MemorySession>) {
+    session_pair_with_responder_datagram_drop(false)
+}
+
+fn session_pair_with_responder_datagram_drop(
+    drop_responder_datagrams: bool,
+) -> (Arc<MemorySession>, Arc<MemorySession>) {
     let (stream_ab_tx, stream_ab_rx) = mpsc::channel(16);
     let (stream_ba_tx, stream_ba_rx) = mpsc::channel(16);
     let (datagram_ab_tx, datagram_ab_rx) = mpsc::channel(256);
@@ -171,6 +181,7 @@ fn session_pair() -> (Arc<MemorySession>, Arc<MemorySession>) {
             stream_rx: Mutex::new(stream_ba_rx),
             datagram_tx: datagram_ab_tx,
             datagram_rx: Mutex::new(datagram_ba_rx),
+            drop_outbound_datagrams: false,
         }),
         Arc::new(MemorySession {
             peer_id: "peer-a".to_owned(),
@@ -178,6 +189,7 @@ fn session_pair() -> (Arc<MemorySession>, Arc<MemorySession>) {
             stream_rx: Mutex::new(stream_ab_rx),
             datagram_tx: datagram_ba_tx,
             datagram_rx: Mutex::new(datagram_ab_rx),
+            drop_outbound_datagrams: drop_responder_datagrams,
         }),
     )
 }
@@ -261,6 +273,112 @@ mod tests {
         let remote = responder_session.accept_bi().await?;
         drop((local, remote));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn datagram_timeout_result_precedes_throughput_progress() -> Result<()> {
+        let (initiator_session, responder_session) = session_pair();
+        let (initiator_control, responder_control) = duplex(64 * 1024);
+        let initiator_flow = flow(initiator_session, initiator_control);
+        let responder_flow = flow(responder_session, responder_control);
+        let responder =
+            tokio::spawn(async move { NetBenchResponder::default().serve(responder_flow).await });
+        let mut test = NetBenchInitiator::new()
+            .start(initiator_flow, example_config())
+            .await?;
+        let mut events = Vec::new();
+        while let Some(event) = test.next().await {
+            events.push(event);
+        }
+        let report = test.result().await?;
+        join_responder(responder).await?;
+
+        let loss_index = events
+            .iter()
+            .position(|event| matches!(event, NetBenchEvent::LossFinished(_)))
+            .expect("Datagram timeout must have a terminal progress event");
+        let live_loss_index = events
+            .iter()
+            .position(|event| matches!(event, NetBenchEvent::LossSample(sample) if sample.sent > 0))
+            .expect("Datagram timeout must publish live probe progress");
+        let throughput_index = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    NetBenchEvent::DownloadWarmupStarted | NetBenchEvent::DownloadStarted
+                )
+            })
+            .expect("full run must advance to throughput");
+        assert!(live_loss_index < loss_index);
+        assert!(loss_index < throughput_index);
+        let NetBenchEvent::LossFinished(loss) = &events[loss_index] else {
+            unreachable!();
+        };
+        assert_eq!(loss, &report.loss);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn confirmed_datagram_timeout_is_reported_while_probing() -> Result<()> {
+        let (initiator_session, responder_session) =
+            session_pair_with_responder_datagram_drop(true);
+        let (initiator_control, responder_control) = duplex(64 * 1024);
+        let initiator_flow = flow(initiator_session, initiator_control);
+        let responder_flow = flow(responder_session, responder_control);
+        let responder =
+            tokio::spawn(async move { NetBenchResponder::default().serve(responder_flow).await });
+        let mut config = example_config();
+        config.loss_duration = Duration::from_millis(300);
+        config.probe_timeout = Duration::from_millis(50);
+        let mut test = NetBenchInitiator::new()
+            .start(initiator_flow, config)
+            .await?;
+        let mut observed_live_timeout = false;
+        while let Some(event) = test.next().await {
+            match event {
+                NetBenchEvent::LossSample(sample) if sample.timed_out > 0 => {
+                    assert!(
+                        sample.outstanding > 0,
+                        "later probes must still be in flight"
+                    );
+                    observed_live_timeout = true;
+                }
+                NetBenchEvent::LossFinished(_) => break,
+                _ => {}
+            }
+        }
+        assert!(
+            observed_live_timeout,
+            "confirmed timeout must be visible before the loss phase finishes"
+        );
+        test.cancel();
+        drop(test);
+        responder.abort();
+        let _ = responder.await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn result_drains_unobserved_progress_without_blocking() -> Result<()> {
+        let (initiator_session, responder_session) = session_pair();
+        let (initiator_control, responder_control) = duplex(64 * 1024);
+        let initiator_flow = flow(initiator_session, initiator_control);
+        let responder_flow = flow(responder_session, responder_control);
+        let responder =
+            tokio::spawn(async move { NetBenchResponder::default().serve(responder_flow).await });
+        let mut config = example_config();
+        config.latency_duration = Duration::from_millis(300);
+        config.latency_interval = Duration::from_millis(1);
+        let test = NetBenchInitiator::new()
+            .start(initiator_flow, config)
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), test.result())
+            .await
+            .map_err(|_| Error::Timeout {
+                stage: "unobserved progress drain",
+            })??;
+        join_responder(responder).await
     }
 
     #[tokio::test]

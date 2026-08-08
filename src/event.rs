@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{NetBenchReport, PathKind};
+use crate::{LossReport, NetBenchReport, PathKind};
 
 /// Fine-grained benchmark-flow negotiation and path progress.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,8 +60,12 @@ pub struct LossSample {
     pub sent: u64,
     /// Echoes received so far.
     pub received: u64,
-    /// Sent probes which have not yet produced a unique echo.
+    /// Probes whose individual response deadline has elapsed.
+    pub timed_out: u64,
+    /// Sent probes still waiting inside their individual response deadline.
     pub outstanding: u64,
+    /// Current cumulative `timed_out / sent`, or zero before the first probe is sent.
+    pub timeout_ratio: f64,
 }
 
 /// Throughput traffic direction.
@@ -105,6 +109,11 @@ pub enum NetBenchEvent {
     LossStarted,
     /// Datagram timeout progress changed.
     LossSample(LossSample),
+    /// Datagram timeout measurement reached its deadline and has a final result.
+    ///
+    /// This is emitted before any throughput warm-up starts, so interactive hosts do not need to
+    /// wait for the complete benchmark report to display the timeout ratio.
+    LossFinished(LossReport),
     /// Download warm-up traffic started.
     DownloadWarmupStarted,
     /// Download measurement started.

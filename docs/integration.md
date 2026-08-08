@@ -73,6 +73,13 @@ at the count implied by the declared duration and cadence.
 
 ## Completion and cancellation
 
+Use `NetBenchInitiator::start` when an interactive host needs progress. Consume
+`NetBenchTest::next` while the test runs, then call `result`; `result` safely drains any events the
+host did not observe. Datagram progress is bounded to a 100-millisecond cadence: `LossSample`
+separates confirmed timeouts from responses that are still outstanding, and `LossFinished` locks
+the value before throughput begins. `run` and `run_probes` discard progress internally and return
+only the final report.
+
 Normal completion uses an explicit flow-finished acknowledgement; it does not wait for Connection
 EOF. Cancelling a `NetBenchTest` cancels only its control, measurement Streams and Datagram routing.
 After responder cleanup returns, the host may immediately reuse the peer session for other flows.

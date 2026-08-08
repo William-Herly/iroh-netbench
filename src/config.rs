@@ -21,7 +21,7 @@ pub struct NetBenchConfig {
     pub loss_duration: Duration,
     /// Number of Datagram probes sent per second, within `1..=1000`.
     pub loss_rate_per_second: u32,
-    /// Time after the last probe before outstanding probes time out.
+    /// Response deadline applied independently to each probe.
     pub probe_timeout: Duration,
     /// Warm-up before download accounting starts.
     pub download_warmup: Duration,
@@ -55,7 +55,7 @@ pub struct NetBenchProbeConfig {
     pub loss_duration: Duration,
     /// Number of Datagram probes sent per second, within `1..=1000`.
     pub loss_rate_per_second: u32,
-    /// Time after the last probe before outstanding probes time out.
+    /// Response deadline applied independently to each probe.
     pub probe_timeout: Duration,
 }
 

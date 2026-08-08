@@ -49,6 +49,9 @@ pub async fn serve(flow: NetBenchFlow, responder: &NetBenchResponder) -> Result<
 Datagram 超时是应用层观测，不等同于底层网络丢包率；吞吐量是固定计时窗口内收到的应用载荷。
 准确口径和限制见[测量语义](docs/measurements.md)。
 
+交互式宿主可通过 `NetBenchInitiator::start` 接收有界频率的实时 RTT、已确认 Datagram 超时和
+吞吐进度；`run` 只返回终态报告。
+
 ## 宿主契约
 
 宿主需要提供：

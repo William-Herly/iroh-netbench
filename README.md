@@ -53,6 +53,9 @@ Datagram timeout is an application observation, not a claim about raw network pa
 Throughput is received application payload over fixed accounting windows. Detailed definitions and
 limitations are in [measurement semantics](docs/measurements.md).
 
+Interactive hosts can use `NetBenchInitiator::start` to receive bounded live RTT, confirmed
+Datagram-timeout and throughput events; `run` returns only the final report.
+
 ## Host contract
 
 The host supplies:

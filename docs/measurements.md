@@ -18,6 +18,17 @@ route or prove that another future flow will use the same path.
 Datagram timeout is not raw IP, UDP or QUIC packet loss. A timeout can also result from queueing,
 application scheduling, flow demultiplexing or a deadline that is too short.
 
+Each probe has its own configured response deadline. The current `quick` and `standard` presets use
+two seconds: an echo arriving before the deadline is received, one still within the deadline is
+outstanding, and one absent when the deadline expires is timed out. A late echo does not reverse the
+completed observation.
+
+Interactive callers receive bounded-cadence cumulative `LossSample` progress with sent, received,
+individually confirmed timeout and still-outstanding counts. The live ratio uses only confirmed
+timeouts; an in-flight probe is never prematurely classified as loss. One terminal `LossFinished`
+result locks the value before a full run starts download warm-up, so later throughput phases keep
+showing the completed Datagram result.
+
 ## Full mode
 
 A full run includes Probe measurements and adds:

@@ -110,16 +110,22 @@ impl NetBenchInitiator {
         flow: NetBenchFlow,
         config: NetBenchProbeConfig,
     ) -> Result<NetBenchProbeReport> {
-        let (event_tx, _event_rx) = mpsc::channel(128);
+        let (event_tx, mut event_rx) = mpsc::channel(128);
+        let drain = tokio::spawn(async move { while event_rx.recv().await.is_some() {} });
+        let events = EventSink(event_tx);
         let overall_timeout = config.overall_timeout;
-        tokio::time::timeout(
-            overall_timeout,
-            run_probe_benchmark(flow, config, &EventSink(event_tx)),
-        )
-        .await
-        .map_err(|_| Error::Timeout {
-            stage: "probe benchmark",
-        })?
+        let result =
+            match tokio::time::timeout(overall_timeout, run_probe_benchmark(flow, config, &events))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(Error::Timeout {
+                    stage: "probe benchmark",
+                }),
+            };
+        drop(events);
+        let _ = drain.await;
+        result
     }
 
     /// Starts a benchmark and returns an event stream plus final result handle.
@@ -213,21 +219,39 @@ impl NetBenchTest {
 
     /// Waits for the final report.
     ///
+    /// Progress events not consumed through [`Self::next`] are drained internally so a caller can
+    /// safely await only the result without filling the bounded event queue.
+    ///
     /// # Errors
     ///
     /// Returns the terminal error from the benchmark task.
     pub async fn result(mut self) -> Result<NetBenchReport> {
-        let task = self
+        let mut task = self
             .task
             .take()
             .ok_or_else(|| Error::Protocol("benchmark result was already consumed".to_owned()))?;
-        match task.await {
-            Ok(result) => result,
-            Err(error) if error.is_cancelled() => Err(Error::Cancelled),
-            Err(error) => Err(Error::Protocol(format!(
-                "benchmark task ended without a result: {error}"
-            ))),
+        loop {
+            tokio::select! {
+                result = &mut task => return benchmark_task_result(result),
+                event = self.events.recv() => {
+                    if event.is_none() {
+                        return benchmark_task_result(task.await);
+                    }
+                }
+            }
         }
+    }
+}
+
+fn benchmark_task_result(
+    result: std::result::Result<Result<NetBenchReport>, tokio::task::JoinError>,
+) -> Result<NetBenchReport> {
+    match result {
+        Ok(result) => result,
+        Err(error) if error.is_cancelled() => Err(Error::Cancelled),
+        Err(error) => Err(Error::Protocol(format!(
+            "benchmark task ended without a result: {error}"
+        ))),
     }
 }
 
@@ -268,6 +292,10 @@ struct EventSink(mpsc::Sender<NetBenchEvent>);
 impl EventSink {
     fn send(&self, event: NetBenchEvent) {
         let _ = self.0.try_send(event);
+    }
+
+    async fn send_required(&self, event: NetBenchEvent) {
+        let _ = self.0.send(event).await;
     }
 }
 
@@ -399,6 +427,9 @@ async fn run_benchmark(
     .await?;
     write_control(&mut control_send, &ControlMessage::StopTest { test_id }).await?;
     let loss = loss_samples.loss_report();
+    events
+        .send_required(NetBenchEvent::LossFinished(loss.clone()))
+        .await;
     test_id += 1;
 
     if !config.download_warmup.is_zero() {
@@ -660,6 +691,9 @@ async fn run_probe_benchmark(
     .await?;
     write_control(&mut control_send, &ControlMessage::StopTest { test_id }).await?;
     let loss = loss_samples.loss_report();
+    events
+        .send_required(NetBenchEvent::LossFinished(loss.clone()))
+        .await;
 
     let after = TransportSnapshot::capture(&connection);
     path_monitor.abort_and_wait().await;
@@ -918,6 +952,8 @@ async fn measure_probes(
     let final_deadline = send_deadline + timeout;
     let mut ticker = tokio::time::interval(interval.max(Duration::from_millis(1)));
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut progress_ticker = tokio::time::interval(Duration::from_millis(100));
+    progress_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut sent_at = HashMap::<u64, Instant>::new();
     let mut received = HashSet::<u64>::new();
     let mut sequence = 0_u64;
@@ -951,6 +987,9 @@ async fn measure_probes(
                 sent_at.insert(sequence, Instant::now());
                 sequence += 1;
             }
+            _ = progress_ticker.tick(), if matches!(&mode, ProbeEventMode::Loss(_)) => {
+                emit_loss_progress(&mode, &sent_at, &received, timeout);
+            }
             datagram = connection.read_datagram() => {
                 let bytes = datagram.map_err(Error::network)?;
                 let Ok(probe) = postcard::from_bytes::<Probe>(&bytes) else {
@@ -962,6 +1001,10 @@ async fn measure_probes(
                 let Some(sent) = sent_at.get(&probe.sequence) else {
                     continue;
                 };
+                let rtt = sent.elapsed();
+                if rtt >= timeout {
+                    continue;
+                }
                 if !received.insert(probe.sequence) {
                     duplicated += 1;
                     continue;
@@ -970,25 +1013,19 @@ async fn measure_probes(
                     reordered += 1;
                 }
                 highest_received = Some(highest_received.map_or(probe.sequence, |value| value.max(probe.sequence)));
-                let rtt = sent.elapsed();
                 rtts.push(rtt);
                 match &mode {
                     ProbeEventMode::Latency(events) => events.send(NetBenchEvent::LatencySample(
                         LatencySample { sequence: probe.sequence, rtt }
                     )),
-                    ProbeEventMode::Loss(events) => events.send(NetBenchEvent::LossSample(
-                        LossSample {
-                            sent: sequence,
-                            received: received.len() as u64,
-                            outstanding: sequence.saturating_sub(received.len() as u64),
-                        }
-                    )),
+                    ProbeEventMode::Loss(_) => {}
                 }
             }
             () = tokio::time::sleep_until(final_deadline) => break,
         }
 
-        if Instant::now() >= send_deadline && received.len() == sent_at.len() {
+        let progress = loss_progress(&sent_at, &received, Instant::now(), timeout);
+        if Instant::now() >= send_deadline && progress.outstanding == 0 {
             break;
         }
     }
@@ -1000,6 +1037,53 @@ async fn measure_probes(
         reordered,
         rtts,
     })
+}
+
+fn emit_loss_progress(
+    mode: &ProbeEventMode,
+    sent_at: &HashMap<u64, Instant>,
+    received: &HashSet<u64>,
+    timeout: Duration,
+) {
+    if let ProbeEventMode::Loss(events) = mode {
+        events.send(NetBenchEvent::LossSample(loss_progress(
+            sent_at,
+            received,
+            Instant::now(),
+            timeout,
+        )));
+    }
+}
+
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "progress ratios are intentionally reported as f64"
+)]
+fn loss_progress(
+    sent_at: &HashMap<u64, Instant>,
+    received: &HashSet<u64>,
+    now: Instant,
+    timeout: Duration,
+) -> LossSample {
+    let sent = sent_at.len() as u64;
+    let timed_out = sent_at
+        .iter()
+        .filter(|(sequence, sent)| {
+            !received.contains(sequence) && now.saturating_duration_since(**sent) >= timeout
+        })
+        .count() as u64;
+    let received = received.len() as u64;
+    LossSample {
+        sent,
+        received,
+        timed_out,
+        outstanding: sent.saturating_sub(received).saturating_sub(timed_out),
+        timeout_ratio: if sent == 0 {
+            0.0
+        } else {
+            timed_out as f64 / sent as f64
+        },
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1349,6 +1433,29 @@ impl<T> Drop for AbortOnDropTask<T> {
         if let Some(task) = &self.0 {
             task.abort();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loss_progress_separates_confirmed_timeout_from_outstanding() {
+        let now = Instant::now();
+        let sent_at = HashMap::from([
+            (0, now - Duration::from_secs(2)),
+            (1, now - Duration::from_millis(100)),
+            (2, now - Duration::from_millis(200)),
+        ]);
+        let received = HashSet::from([2]);
+
+        let sample = loss_progress(&sent_at, &received, now, Duration::from_secs(1));
+        assert_eq!(sample.sent, 3);
+        assert_eq!(sample.received, 1);
+        assert_eq!(sample.timed_out, 1);
+        assert_eq!(sample.outstanding, 1);
+        assert!((sample.timeout_ratio - (1.0 / 3.0)).abs() < f64::EPSILON);
     }
 }
 

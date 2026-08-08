@@ -5,6 +5,13 @@ Versioning for the Rust crate; wire-protocol and report-schema versions are trac
 
 ## [Unreleased]
 
+### Changed
+
+- Datagram probe progress now reports sent, received, individually confirmed timeouts, outstanding
+  responses and the current timeout ratio at a bounded cadence, including when every response times
+  out. A terminal `LossFinished` event locks the result before throughput warm-up begins; the wire
+  protocol and report schema remain at `1`.
+
 ## [0.2.0] - 2026-08-08
 
 ### Changed
@@ -21,8 +28,7 @@ Versioning for the Rust crate; wire-protocol and report-schema versions are trac
   deduplicates sequences and enforces the declared request budget.
 - The unused `sample_interval` setting was removed; throughput progress uses a fixed internal
   250-millisecond cadence.
-- Live loss progress reports outstanding probes; terminal timeout classification remains in the
-  final `LossReport`.
+- Live loss progress reports sent, received and outstanding probes.
 
 ### Added
 
