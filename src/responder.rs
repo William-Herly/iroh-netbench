@@ -802,7 +802,7 @@ async fn receive_upload(
                     Ok(Ok(read)) if read > 0 && Instant::now() <= deadline => {
                         total.fetch_add(read as u64, Ordering::Relaxed);
                     }
-                    Ok(Ok(_)) | Err(_) => break,
+                    Ok(Ok(_) | Err(Error::FlowStopped)) | Err(_) => break,
                     Ok(Err(error)) => return Err(error),
                 }
             }
