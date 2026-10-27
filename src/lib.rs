@@ -19,13 +19,13 @@ pub use event::{
     ThroughputSample,
 };
 pub use flow::{
-    NetBenchBidirectionalStream, NetBenchFlow, NetBenchReceiveStream, NetBenchSendStream,
-    NetBenchSession, NetBenchTelemetry,
+    CounterSnapshot, NetBenchBidirectionalStream, NetBenchFlow, NetBenchReceiveStream,
+    NetBenchSendStream, NetBenchSession, NetBenchTelemetry,
 };
 pub use initiator::{NetBenchInitiator, NetBenchTest};
 pub use report::{
-    LatencyReport, LoadedLatencyReport, LossReport, MeasurementPathReport, NetBenchProbeReport,
-    NetBenchReport, PathKind, ThroughputReport, TransportReport,
+    CounterDelta, LatencyReport, LoadedLatencyReport, LossReport, MeasurementPathReport,
+    NetBenchProbeReport, NetBenchReport, PathKind, ThroughputReport, TransportReport,
 };
 pub use responder::{NetBenchResponder, NetBenchResponderBuilder, ThroughputPolicy};
 

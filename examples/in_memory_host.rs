@@ -31,7 +31,7 @@ impl NetBenchSession for MemorySession {
     fn telemetry(&self) -> NetBenchTelemetry {
         NetBenchTelemetry {
             path: PathKind::Direct,
-            current_mtu: 1_200,
+            current_mtu: Some(1_200),
             ..NetBenchTelemetry::default()
         }
     }

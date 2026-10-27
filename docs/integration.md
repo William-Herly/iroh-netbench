@@ -56,6 +56,16 @@ The core crate intentionally does not publish an iroh-version-specific adapter. 
 upgrades in the host and prevents a convenience wrapper from silently competing with the host's
 dispatcher.
 
+## Telemetry ownership
+
+Supply only available telemetry. Cumulative counters carry a host-owned connection/path generation
+in `CounterSnapshot::scope`; change it on replacement or reset, and do not reuse it during a flow.
+Unavailable values or identities produce `None`. MTU and RTT are optional final-path gauges.
+Keep the admitted Session fixed for the flow; this API does not authorize reconnecting or silently
+replacing its transport. Report availability, comparison failures and path-window facts to callers
+without defaulting them to zero or reconstructing them from lossy progress events. Exact windows
+and counter meanings are defined in [measurement semantics](measurements.md#telemetry-supplied-by-the-host).
+
 ## Admission and responder limits
 
 Authenticate the peer and authorize bandwidth use before constructing `NetBenchFlow`. The responder

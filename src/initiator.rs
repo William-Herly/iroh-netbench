@@ -28,6 +28,7 @@ use crate::{
     },
 };
 
+const PATH_OBSERVATION_INTERVAL: Duration = Duration::from_millis(250);
 const THROUGHPUT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 type SendStream = Box<dyn NetBenchSendStream>;
 type RecvStream = Box<dyn NetBenchReceiveStream>;
@@ -360,22 +361,27 @@ async fn run_benchmark(
     }
 
     stage.set("path stabilization");
-    let path_at_flow_start = selected_path_kind(&connection);
-    let (initial_path, stabilization_time_to_direct) = stabilize_path(
+    let preparation_path = selected_path_kind(&connection);
+    let (_, stabilization_time_to_direct) = stabilize_path(
         &connection,
         config.path_stabilization_timeout,
         connect_started,
         events,
     )
     .await;
+    let before = TransportSnapshot::capture(&connection);
+    let initial_path = before.0.path;
     events.send(NetBenchEvent::Ready(FlowInfo {
         negotiation_time: first_control_message_time,
         path: initial_path,
     }));
-    let (path_monitor, path_monitor_state) =
-        spawn_path_monitor(connection.clone(), events.clone(), connect_started);
+    let (path_monitor, path_monitor_state) = spawn_path_monitor(
+        connection.clone(),
+        events.clone(),
+        connect_started,
+        initial_path,
+    );
 
-    let before = TransportSnapshot::capture(&connection);
     let mut test_id = 1_u64;
 
     stage.set("idle latency");
@@ -524,15 +530,16 @@ async fn run_benchmark(
     let (upload, upload_loaded) = tokio::try_join!(upload_future, upload_probe_future)?;
 
     stage.set("finalization");
-    let after = TransportSnapshot::capture(&connection);
     path_monitor.abort_and_wait().await;
-    let final_path = selected_path_kind(&connection);
-    let path_monitor_state = lock_unpoisoned(&path_monitor_state).clone();
-    let time_to_direct = if path_at_flow_start == PathKind::Relay {
-        stabilization_time_to_direct.or(path_monitor_state.time_to_direct)
-    } else {
-        None
-    };
+    let after = TransportSnapshot::capture(&connection);
+    let mut path_monitor_state = lock_unpoisoned(&path_monitor_state).clone();
+    path_monitor_state.observe(after.0.path, connect_started.elapsed());
+    let path_report = path_monitor_state.report(
+        preparation_path,
+        initial_path,
+        first_control_message_time,
+        stabilization_time_to_direct,
+    );
     let download_p50 = latency_report(&download_loaded.rtts).p50;
     let upload_p50 = latency_report(&upload_loaded.rtts).p50;
     let loaded_latency = LoadedLatencyReport {
@@ -550,16 +557,7 @@ async fn run_benchmark(
         protocol_version: selected_version,
         peer_id,
         total_duration: total_started.elapsed(),
-        path: MeasurementPathReport {
-            negotiation_time: first_control_message_time,
-            initial_path,
-            final_path,
-            path_changed: path_at_flow_start != initial_path
-                || initial_path != final_path
-                || path_monitor_state.path_changed,
-            became_direct: time_to_direct.is_some(),
-            time_to_direct,
-        },
+        path: path_report,
         idle_latency,
         loss,
         download,
@@ -627,21 +625,26 @@ async fn run_probe_benchmark(
         return finish_with_error(&mut control_send, &mut control_recv, error).await;
     }
 
-    let path_at_flow_start = selected_path_kind(&connection);
-    let (initial_path, stabilization_time_to_direct) = stabilize_path(
+    let preparation_path = selected_path_kind(&connection);
+    let (_, stabilization_time_to_direct) = stabilize_path(
         &connection,
         config.path_stabilization_timeout,
         connect_started,
         events,
     )
     .await;
+    let before = TransportSnapshot::capture(&connection);
+    let initial_path = before.0.path;
     events.send(NetBenchEvent::Ready(FlowInfo {
         negotiation_time: first_control_message_time,
         path: initial_path,
     }));
-    let (path_monitor, path_monitor_state) =
-        spawn_path_monitor(connection.clone(), events.clone(), connect_started);
-    let before = TransportSnapshot::capture(&connection);
+    let (path_monitor, path_monitor_state) = spawn_path_monitor(
+        connection.clone(),
+        events.clone(),
+        connect_started,
+        initial_path,
+    );
 
     let mut test_id = 1_u64;
     events.send(NetBenchEvent::LatencyStarted);
@@ -695,15 +698,16 @@ async fn run_probe_benchmark(
         .send_required(NetBenchEvent::LossFinished(loss.clone()))
         .await;
 
-    let after = TransportSnapshot::capture(&connection);
     path_monitor.abort_and_wait().await;
-    let final_path = selected_path_kind(&connection);
-    let path_monitor_state = lock_unpoisoned(&path_monitor_state).clone();
-    let time_to_direct = if path_at_flow_start == PathKind::Relay {
-        stabilization_time_to_direct.or(path_monitor_state.time_to_direct)
-    } else {
-        None
-    };
+    let after = TransportSnapshot::capture(&connection);
+    let mut path_monitor_state = lock_unpoisoned(&path_monitor_state).clone();
+    path_monitor_state.observe(after.0.path, connect_started.elapsed());
+    let path_report = path_monitor_state.report(
+        preparation_path,
+        initial_path,
+        first_control_message_time,
+        stabilization_time_to_direct,
+    );
     finish_flow(&mut control_send, &mut control_recv).await?;
 
     Ok(NetBenchProbeReport {
@@ -711,16 +715,7 @@ async fn run_probe_benchmark(
         protocol_version: selected_version,
         peer_id,
         total_duration: total_started.elapsed(),
-        path: MeasurementPathReport {
-            negotiation_time: first_control_message_time,
-            initial_path,
-            final_path,
-            path_changed: path_at_flow_start != initial_path
-                || initial_path != final_path
-                || path_monitor_state.path_changed,
-            became_direct: time_to_direct.is_some(),
-            time_to_direct,
-        },
+        path: path_report,
         idle_latency,
         loss,
         transport: after.delta(before),
@@ -1370,42 +1365,91 @@ fn spawn_sampler(
     }))
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct PathMonitorState {
+    last_path: PathKind,
     path_changed: bool,
+    unknown_path_observed: bool,
     time_to_direct: Option<Duration>,
+}
+
+impl PathMonitorState {
+    fn new(initial_path: PathKind) -> Self {
+        Self {
+            last_path: initial_path,
+            path_changed: false,
+            unknown_path_observed: initial_path == PathKind::Unknown,
+            time_to_direct: None,
+        }
+    }
+
+    fn observe(&mut self, current: PathKind, elapsed: Duration) -> bool {
+        self.unknown_path_observed |= current == PathKind::Unknown;
+        if current == self.last_path {
+            return false;
+        }
+        self.path_changed = true;
+        if self.last_path == PathKind::Relay
+            && matches!(
+                current,
+                PathKind::Direct | PathKind::DirectIpv4 | PathKind::DirectIpv6
+            )
+            && self.time_to_direct.is_none()
+        {
+            self.time_to_direct = Some(elapsed);
+        }
+        self.last_path = current;
+        true
+    }
+
+    fn report(
+        self,
+        preparation_path: PathKind,
+        initial_path: PathKind,
+        negotiation_time: Duration,
+        stabilization_time_to_direct: Option<Duration>,
+    ) -> MeasurementPathReport {
+        let preparation_transition = if preparation_path == PathKind::Relay {
+            stabilization_time_to_direct
+        } else {
+            None
+        };
+        let time_to_direct = preparation_transition.or(self.time_to_direct);
+        MeasurementPathReport {
+            negotiation_time,
+            preparation_path,
+            initial_path,
+            final_path: self.last_path,
+            path_changed: self.path_changed,
+            unknown_path_observed: self.unknown_path_observed,
+            observation_interval: PATH_OBSERVATION_INTERVAL,
+            became_direct: time_to_direct.is_some(),
+            time_to_direct,
+        }
+    }
 }
 
 fn spawn_path_monitor(
     connection: Connection,
     events: EventSink,
     flow_started: Instant,
+    initial_path: PathKind,
 ) -> (AbortOnDropTask<()>, Arc<Mutex<PathMonitorState>>) {
-    let state = Arc::new(Mutex::new(PathMonitorState::default()));
+    // Seed from the same synchronous snapshot as transport counters. Reading inside
+    // the task would lose changes before its first poll.
+    let state = Arc::new(Mutex::new(PathMonitorState::new(initial_path)));
     let task_state = Arc::clone(&state);
     let task = AbortOnDropTask::new(tokio::spawn(async move {
-        let mut previous = selected_path_kind(&connection);
-        let mut ticker = tokio::time::interval(Duration::from_millis(250));
+        let mut ticker = tokio::time::interval(PATH_OBSERVATION_INTERVAL);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
             let current = selected_path_kind(&connection);
-            if current != previous {
-                let mut state = lock_unpoisoned(&task_state);
-                state.path_changed = true;
-                if previous == PathKind::Relay
-                    && matches!(
-                        current,
-                        PathKind::Direct | PathKind::DirectIpv4 | PathKind::DirectIpv6
-                    )
-                    && state.time_to_direct.is_none()
-                {
-                    state.time_to_direct = Some(flow_started.elapsed());
-                }
-                drop(state);
+            let changed = lock_unpoisoned(&task_state).observe(current, flow_started.elapsed());
+            if changed {
                 events.send(NetBenchEvent::FlowStage(FlowStage::PathObserved {
                     path: current,
                 }));
-                previous = current;
             }
         }
     }));
@@ -1433,29 +1477,6 @@ impl<T> Drop for AbortOnDropTask<T> {
         if let Some(task) = &self.0 {
             task.abort();
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn loss_progress_separates_confirmed_timeout_from_outstanding() {
-        let now = Instant::now();
-        let sent_at = HashMap::from([
-            (0, now - Duration::from_secs(2)),
-            (1, now - Duration::from_millis(100)),
-            (2, now - Duration::from_millis(200)),
-        ]);
-        let received = HashSet::from([2]);
-
-        let sample = loss_progress(&sent_at, &received, now, Duration::from_secs(1));
-        assert_eq!(sample.sent, 3);
-        assert_eq!(sample.received, 1);
-        assert_eq!(sample.timed_out, 1);
-        assert_eq!(sample.outstanding, 1);
-        assert!((sample.timeout_ratio - (1.0 / 3.0)).abs() < f64::EPSILON);
     }
 }
 
@@ -1514,59 +1535,49 @@ fn selected_path_kind(connection: &Connection) -> PathKind {
     connection.telemetry().path
 }
 
-#[derive(Clone, Copy, Default)]
-struct TransportSnapshot {
-    connection_lost_packets: u64,
-    connection_lost_bytes: u64,
-    udp_rx_datagrams: u64,
-    udp_tx_datagrams: u64,
-    congestion_events: u64,
-    black_holes_detected: u64,
-    current_mtu: u16,
-    rtt: Duration,
-}
+#[derive(Clone, Copy)]
+struct TransportSnapshot(NetBenchTelemetry);
 
 impl TransportSnapshot {
     fn capture(connection: &Connection) -> Self {
-        let telemetry = connection.telemetry();
-        Self {
-            connection_lost_packets: telemetry.lost_packets,
-            connection_lost_bytes: telemetry.lost_bytes,
-            udp_rx_datagrams: telemetry.rx_datagrams,
-            udp_tx_datagrams: telemetry.tx_datagrams,
-            congestion_events: telemetry.congestion_events,
-            black_holes_detected: telemetry.black_holes_detected,
-            current_mtu: telemetry.current_mtu,
-            rtt: telemetry.rtt,
-        }
+        Self(connection.telemetry())
     }
 
     fn delta(self, before: Self) -> TransportReport {
         TransportReport {
-            lost_packets: self
-                .connection_lost_packets
-                .saturating_sub(before.connection_lost_packets),
-            lost_bytes: self
-                .connection_lost_bytes
-                .saturating_sub(before.connection_lost_bytes),
-            congestion_events: self
-                .congestion_events
-                .saturating_sub(before.congestion_events),
-            udp_rx_datagrams: self
-                .udp_rx_datagrams
-                .saturating_sub(before.udp_rx_datagrams),
-            udp_tx_datagrams: self
-                .udp_tx_datagrams
-                .saturating_sub(before.udp_tx_datagrams),
-            current_mtu: self.current_mtu,
-            black_holes_detected: self
-                .black_holes_detected
-                .saturating_sub(before.black_holes_detected),
-            final_rtt: self.rtt,
+            lost_packets: counter_delta(before.0.lost_packets, self.0.lost_packets),
+            lost_bytes: counter_delta(before.0.lost_bytes, self.0.lost_bytes),
+            congestion_events: counter_delta(before.0.congestion_events, self.0.congestion_events),
+            udp_rx_datagrams: counter_delta(before.0.rx_datagrams, self.0.rx_datagrams),
+            udp_tx_datagrams: counter_delta(before.0.tx_datagrams, self.0.tx_datagrams),
+            current_mtu: self.0.current_mtu,
+            black_holes_detected: counter_delta(
+                before.0.black_holes_detected,
+                self.0.black_holes_detected,
+            ),
+            final_rtt: self.0.rtt,
         }
+    }
+}
+
+fn counter_delta(
+    before: Option<crate::CounterSnapshot>,
+    after: Option<crate::CounterSnapshot>,
+) -> crate::CounterDelta {
+    use crate::CounterDelta;
+    match (before, after) {
+        (Some(before), Some(after)) if before.scope != after.scope => CounterDelta::ScopeChanged,
+        (Some(before), Some(after)) => after
+            .value
+            .checked_sub(before.value)
+            .map_or(CounterDelta::Reset, CounterDelta::Measured),
+        _ => CounterDelta::Unavailable,
     }
 }
 
 fn duration_ms(duration: Duration) -> u32 {
     u32::try_from(duration.as_millis()).unwrap_or(u32::MAX)
 }
+
+#[cfg(test)]
+mod tests;

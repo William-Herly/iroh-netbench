@@ -10,10 +10,9 @@ route or prove that another future flow will use the same path.
 - **Idle latency** sends application Datagram echoes at the configured interval and reports min,
   mean, p50, p95, p99, maximum and adjacent-sample jitter.
 - **Datagram timeout** reports sent, received, timed-out, duplicate and reordered application probes.
-- **Path observation** records the path at measurement start/end and any Relay-to-direct transition
-  reported by the host telemetry.
-- **Transport delta** subtracts the host telemetry snapshot taken before the run from the snapshot
-  taken after it.
+- **Path observation** records preparation separately from the measurement window, with initial,
+  final, changed and unknown observations.
+- **Transport delta** compares supported counters within the same connection or path generation.
 
 Datagram timeout is not raw IP, UDP or QUIC packet loss. A timeout can also result from queueing,
 application scheduling, flow demultiplexing or a deadline that is too short.
@@ -48,14 +47,41 @@ clean terminal condition only in those throughput loops; the same error elsewher
 
 `TransportReport` can include lost packets/bytes, congestion events, sent/received Datagrams, current
 MTU, black-hole detections and smoothed RTT. These values are only as complete and current as the
-host's `NetBenchTelemetry` implementation. Unsupported counters should remain zero and path kind
-should be `Unknown` rather than inferred.
+host's `NetBenchTelemetry` implementation. Unsupported values are `None`, and unavailable path kind
+is `Unknown`; neither is replaced with a measured zero.
+
+Each cumulative value is a `CounterSnapshot { scope, value }`. The host owns the scope identity and
+changes it when the connection/path or counter lifetime changes; a path kind such as Direct IPv4
+is not an identity. `CounterDelta` distinguishes `Measured(0)` from `Unavailable`, `Reset` (a decrease
+within one advertised scope) and `ScopeChanged`. Counters must not silently reset and catch up under
+the same scope. A path counter measures only that counter's scope, not the aggregate of all paths
+used by a connection. Summing currently open paths cannot reconstruct retired-path history.
+
+The observation window begins with one synchronous telemetry snapshot after initial stabilization.
+It includes idle probes, loss probes, throughput warmups, both throughput directions and their
+cleanup. At the end, the path monitor is stopped before the final telemetry snapshot is captured;
+flow-finished acknowledgement is outside this window. Connection counters can include concurrent
+non-benchmark traffic on the shared Session. They are not per-flow loss or throughput counters.
+Each direction's payload throughput excludes warmup and uses its own declared accounting window.
+
+`preparation_path` is sampled after negotiation, before initial stabilization. `initial_path` and
+`final_path` share the transport-counter boundaries. `path_changed` describes differences observed
+inside that window only; preparation convergence is separate. Periodic observations have a nominal
+250 ms interval, with no replay of missed ticks. They retain observed round trips even when initial
+and final path kinds match, but cannot prove that shorter migrations never occurred. Physical path
+changes that retain the same high-level kind are also outside this classification.
+
+`MeasurementPathReport::observed_path()` returns `Unknown` if any window sample was unknown,
+otherwise `Mixed` for an observed change, or the initial kind for an unchanged observation. The
+underlying changed/unknown flags and boundary paths remain available together. Relay-to-direct
+timing describes observed preparation or in-window convergence; it does not change the classification
+of an otherwise stable measurement window.
 
 ## Comparing results
 
 For useful comparisons, keep the preset, responder policy, path kind, application version and host
-adapter constant. Treat a Direct/Relay path change during a run as `Mixed`; do not compare its
-throughput directly with a stable single-path run.
+adapter constant. Use `observed_path()` and retain incomplete observations; do not compare a mixed
+or unknown window directly with a stable known-path run.
 
 The report `schema_version` and negotiated `protocol_version` are separate from the Rust crate's
 Semantic Version. The pre-1.0 implementation currently uses initial value `1` for both.

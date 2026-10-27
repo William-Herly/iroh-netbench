@@ -7,6 +7,13 @@ Versioning for the Rust crate; wire-protocol and report-schema versions are trac
 
 ### Changed
 
+- Path reports separate preparation from the measurement window, retain unknown observations,
+  and provide `observed_path()` with the sampling interval. Initial path sampling no longer waits
+  for the monitor task's first poll; the final sample shares the transport snapshot boundary.
+- Host telemetry counters are optional `CounterSnapshot` values with explicit lifetime scopes.
+  Report deltas distinguish measured zero, unavailable, reset and scope-changed values; MTU/RTT
+  are optional. Host adapters and report consumers must migrate these Rust/report types. This
+  replaces the pre-1.0 report shape at schema `1`; encoded messages and protocol `1` are unchanged.
 - Datagram probe progress now reports sent, received, individually confirmed timeouts, outstanding
   responses and the current timeout ratio at a bounded cadence, including when every response times
   out. A terminal `LossFinished` event locks the result before throughput warm-up begins; the wire

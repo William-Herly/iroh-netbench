@@ -6,41 +6,53 @@ use async_trait::async_trait;
 
 use crate::{PathKind, Result};
 
+/// A cumulative counter from one host-owned connection or path generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CounterSnapshot {
+    /// Opaque identity of this counter's lifetime. Change it on replacement or reset.
+    ///
+    /// The host must not reuse an identity during a benchmark flow. Path counters must
+    /// change scope when their path changes, even if the high-level path kind is unchanged.
+    pub scope: u64,
+    /// Cumulative count within this scope.
+    pub value: u64,
+}
+
 /// One transport telemetry snapshot supplied by the host session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NetBenchTelemetry {
     /// Currently selected transport path.
     pub path: PathKind,
-    /// QUIC packets declared lost.
-    pub lost_packets: u64,
-    /// QUIC bytes declared lost.
-    pub lost_bytes: u64,
+    /// Connection-wide QUIC packets declared lost.
+    pub lost_packets: Option<CounterSnapshot>,
+    /// Connection-wide QUIC bytes declared lost.
+    pub lost_bytes: Option<CounterSnapshot>,
     /// Congestion events on the selected path.
-    pub congestion_events: u64,
+    pub congestion_events: Option<CounterSnapshot>,
     /// Received transport datagrams.
-    pub rx_datagrams: u64,
+    pub rx_datagrams: Option<CounterSnapshot>,
     /// Transmitted transport datagrams.
-    pub tx_datagrams: u64,
-    /// Current path MTU, or zero when unavailable.
-    pub current_mtu: u16,
+    pub tx_datagrams: Option<CounterSnapshot>,
+    /// Current path MTU, or `None` when unavailable.
+    pub current_mtu: Option<u16>,
     /// Path black-hole detections.
-    pub black_holes_detected: u64,
+    pub black_holes_detected: Option<CounterSnapshot>,
     /// Current smoothed transport RTT.
-    pub rtt: Duration,
+    pub rtt: Option<Duration>,
 }
 
 impl Default for NetBenchTelemetry {
     fn default() -> Self {
         Self {
             path: PathKind::Unknown,
-            lost_packets: 0,
-            lost_bytes: 0,
-            congestion_events: 0,
-            rx_datagrams: 0,
-            tx_datagrams: 0,
-            current_mtu: 0,
-            black_holes_detected: 0,
-            rtt: Duration::ZERO,
+            lost_packets: None,
+            lost_bytes: None,
+            congestion_events: None,
+            rx_datagrams: None,
+            tx_datagrams: None,
+            current_mtu: None,
+            black_holes_detected: None,
+            rtt: None,
         }
     }
 }

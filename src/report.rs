@@ -26,16 +26,36 @@ pub enum PathKind {
 pub struct MeasurementPathReport {
     /// Time from starting the business flow until the first control response.
     pub negotiation_time: Duration,
+    /// Path sampled after negotiation, before preparation/stabilization.
+    pub preparation_path: PathKind,
     /// Selected path at the start of the measurement window.
     pub initial_path: PathKind,
     /// Selected path at the end of the measurement window.
     pub final_path: PathKind,
-    /// Whether the selected path changed during the flow.
+    /// Whether sampled path kinds differed during measurements, excluding preparation.
     pub path_changed: bool,
+    /// Whether any measurement-window sample had no known path.
+    pub unknown_path_observed: bool,
+    /// Nominal sampling interval; shorter transitions can go unobserved.
+    pub observation_interval: Duration,
     /// Whether a relay-to-direct transition was seen.
     pub became_direct: bool,
-    /// Time from business-flow start until the first direct path.
+    /// Time from business-flow start until the first observed relay-to-direct transition.
     pub time_to_direct: Option<Duration>,
+}
+
+impl MeasurementPathReport {
+    /// Summarizes observed measurement paths without treating missing samples as a known path.
+    #[must_use]
+    pub const fn observed_path(&self) -> PathKind {
+        if self.unknown_path_observed {
+            PathKind::Unknown
+        } else if self.path_changed {
+            PathKind::Mixed
+        } else {
+            self.initial_path
+        }
+    }
 }
 
 /// Idle or loaded RTT distribution.
@@ -106,25 +126,41 @@ pub struct LoadedLatencyReport {
     pub upload_increase: Duration,
 }
 
-/// Delta between transport snapshots taken before and after measurements.
+/// A counter delta, or the reason its snapshots cannot be compared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CounterDelta {
+    /// At least one snapshot lacked a value or a stable scope identity.
+    Unavailable,
+    /// The counter decreased within the same advertised scope.
+    Reset,
+    /// The counter belongs to different connection/path generations at the boundaries.
+    ScopeChanged,
+    /// Measured increase, including a genuine zero.
+    Measured(u64),
+}
+
+/// Delta over the full observation window, including probes, warmups and both directions.
+///
+/// Connection counters can include other traffic on the caller-owned Session. They are not
+/// per-flow payload counters, and their window differs from each throughput direction's window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransportReport {
-    /// QUIC packets declared lost.
-    pub lost_packets: u64,
-    /// QUIC bytes declared lost.
-    pub lost_bytes: u64,
-    /// Congestion events.
-    pub congestion_events: u64,
+    /// Connection-wide QUIC packets declared lost.
+    pub lost_packets: CounterDelta,
+    /// Connection-wide QUIC bytes declared lost.
+    pub lost_bytes: CounterDelta,
+    /// Congestion events within the supplied path counter's scope.
+    pub congestion_events: CounterDelta,
     /// UDP datagrams received.
-    pub udp_rx_datagrams: u64,
+    pub udp_rx_datagrams: CounterDelta,
     /// UDP datagrams transmitted.
-    pub udp_tx_datagrams: u64,
+    pub udp_tx_datagrams: CounterDelta,
     /// Final path maximum transmission unit.
-    pub current_mtu: u16,
-    /// Black-hole detections.
-    pub black_holes_detected: u64,
+    pub current_mtu: Option<u16>,
+    /// Black-hole detections within the supplied path counter's scope.
+    pub black_holes_detected: CounterDelta,
     /// Final transport RTT estimate.
-    pub final_rtt: Duration,
+    pub final_rtt: Option<Duration>,
 }
 
 /// Complete result of a benchmark run.
